@@ -2,10 +2,14 @@
 ## Title: Forever Ledger
 ## Notes: Auditable gold, inventory and auction records for WoW Forever.
 ## Author: Peter
-## Version: 0.1.0
+## Version: 0.2.0
 ## SavedVariables: ForeverLedgerDB
 ## OptionalDeps: Auctionator
 Core.lua
 Collectors.lua
+Disenchant.lua
+Valuation.lua
+Prices.lua
+Chart.lua
 UI.lua
 Main.lua

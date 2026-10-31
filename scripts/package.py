@@ -8,7 +8,7 @@ toc=(root/'ForeverLedger'/'ForeverLedger.toc').read_text(encoding='utf-8')
 version=next(line.split(':',1)[1].strip() for line in toc.splitlines() if line.startswith('## Version:'))
 files=[]
 for folder in ('ForeverLedger','ForeverLedger-tools'):
-    files.extend(p for p in sorted((root/folder).rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix in ('.lua','.toc','.py'))
+    files.extend(p for p in sorted((root/folder).rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix in ('.lua','.toc','.py','.txt'))
 files.extend(root/n for n in ('README.md','SCHEMA.md','TESTING.md','LICENSE.txt','VALIDATION.txt'))
 dist=root/'dist'
 dist.mkdir(exist_ok=True)
@@ -18,8 +18,9 @@ with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
         z.write(path,path.relative_to(root).as_posix())
 with zipfile.ZipFile(archive) as z:
     assert z.testzip() is None
-    for line in toc.splitlines():
-        if line and not line.startswith('#'):
-            assert 'ForeverLedger/'+line in z.namelist()
+    for manifest in (root/'ForeverLedger').glob('*.toc'):
+        for line in manifest.read_text().splitlines():
+            if line and not line.startswith('#'):
+                assert 'ForeverLedger/'+line in z.namelist()
 print(f'{archive}: {len(files)} files')
 print('SHA256: '+hashlib.sha256(archive.read_bytes()).hexdigest())

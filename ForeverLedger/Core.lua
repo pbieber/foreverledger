@@ -1,6 +1,6 @@
 local _, F = ...
 ForeverLedger = F
-F.VERSION = "0.1.0"
+F.VERSION = "0.2.0"
 F.SCHEMA = 1
 
 function F.Copy(value)
@@ -75,6 +75,7 @@ function F.Init(db, identity)
     F.character.snapshots = F.character.snapshots or {}
     F.batch, F.intents = {balances={}, claims={}}, {}
     F.session = F.Emit("session", {version=F.VERSION, build=identity.build}).id
+    if F.InitValuation then F.InitValuation() end
 end
 
 function F.Emit(kind, data)
@@ -95,6 +96,7 @@ function F.ObserveBalance(money, context)
     if not money then return end
     local old = F.character.balance
     F.character.balance = money
+    F.historyDirty=true
     if not F.baselined then
         F.baselined = true
         F.Emit("baseline", {balance=money, previous=old, gap=old and money-old or 0})
@@ -176,9 +178,18 @@ function F.Flush()
 end
 
 function F.Snapshot(location, rows, complete, extra)
+    rows=F.Copy(rows)
+    if F.ValueRow then
+        for _,row in ipairs(rows) do
+            if row.item and (location=="bags" or location=="equipment" or location=="bank") then
+                row.valuation=F.ValueRow(row,F.character,F.marketScope)
+            end
+        end
+    end
     local d = {location=location, rows=rows, complete=complete, metadata=extra}
     local e = F.Emit("snapshot", d)
     F.character.snapshots[location] = {eventID=e.id, time=e.time, data=e.data}
+    F.historyDirty=true
     return e
 end
 

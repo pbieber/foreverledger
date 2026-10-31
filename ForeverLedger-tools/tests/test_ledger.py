@@ -112,7 +112,7 @@ class AddonTests(unittest.TestCase):
         self.lua=LuaRuntime(unpack_returned_tuples=True)
         self.lua.execute(MOCKS)
         self.lua.execute("F={}")
-        for name in ("Core.lua","Collectors.lua","UI.lua"):
+        for name in ("Core.lua","Collectors.lua","Disenchant.lua","Valuation.lua","Prices.lua","Chart.lua","UI.lua"):
             code=(ROOT/"ForeverLedger"/name).read_text(encoding="utf-8")
             self.lua.execute("assert(loadstring(...))('ForeverLedger',F)",code)
         self.lua.execute('F.Init({}, {guid="Player-Main",name="Main-Realm",realm="Realm",build="test"}); F.ObserveBalance(WALLET)')

@@ -1,0 +1,15 @@
+## Interface: 20506
+## Title: Forever Ledger
+## Notes: Gold ledger and valuation. TBC Anniversary compatibility preview.
+## Author: Peter
+## Version: 0.2.0
+## SavedVariables: ForeverLedgerDB
+## OptionalDeps: Auctionator
+Core.lua
+Collectors.lua
+Disenchant.lua
+Valuation.lua
+Prices.lua
+Chart.lua
+UI.lua
+Main.lua

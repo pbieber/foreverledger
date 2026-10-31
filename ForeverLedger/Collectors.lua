@@ -15,12 +15,10 @@ function F.Item(link, id, name)
     id = F.Number(id) or (type(link)=="string" and tonumber(link:match("item:(%d+)")))
     local get = C_Item and C_Item.GetItemInfo or GetItemInfo
     local values = {F.Call(get, link or id)}
-    local item = {id=id, link=link, name=name or values[1], vendorPrice=F.Number(values[11])}
-    if Auctionator and Auctionator.API and Auctionator.API.v1 then
-        local price = F.Call(Auctionator.API.v1.GetAuctionPriceByItemLink,"ForeverLedger",link)
-        item.marketPrice = F.Number(price)
-        if item.marketPrice then item.priceSource="Auctionator"; item.priceObservedAt=F.Now() end
-    end
+    local item = {id=id, link=link or values[2], name=name or values[1], vendorPrice=F.Number(values[11]),
+        quality=values[3],level=values[4],equipLoc=values[9],classID=values[12],subclassID=values[13],
+        bindType=values[14],expansionID=values[15]}
+    if F.TrackItem then F.TrackItem(item) end
     return item
 end
 
@@ -39,8 +37,15 @@ function F.BagRows(ids)
             if info then
                 local quantity = F.Number(info.stackCount)
                 if not quantity then return rows,false end
-                rows[#rows+1] = {bag=bag,slot=slot,quantity=quantity,
-                    item=F.Item(info.hyperlink,info.itemID),bound=info.isBound}
+                local item=F.Item(info.hyperlink,info.itemID)
+                local loc=ItemLocation and ItemLocation:CreateFromBagAndSlot(bag,slot)
+                local bound=info.isBound
+                if bound==nil and loc and C_Item then bound=F.Call(C_Item.IsBound,loc) end
+                if bound==nil and item.bindType==0 then bound=false end
+                local key=loc and C_AuctionHouse and F.Call(C_AuctionHouse.GetItemKeyFromItem,loc)
+                if key then item.auctionItemKey=key; if F.TrackItem then F.TrackItem(item) end end
+                rows[#rows+1] = {bag=bag,slot=slot,quantity=quantity,item=item,bound=bound,
+                    guid=loc and C_Item and F.Call(C_Item.GetItemGUID,loc)}
             end
         end
     end
@@ -51,7 +56,7 @@ function F.ScanBags(force)
     local ids = {}
     for id=0,(NUM_TOTAL_EQUIPPED_BAG_SLOTS or NUM_BAG_SLOTS or 4) do ids[#ids+1]=id end
     local rows,complete = F.BagRows(ids)
-    -- Price retrieval time is not used to suppress snapshots: scans are debounced.
+    -- Only persistent item facts participate in this signature.
     local signature = F.JSON(rows)
     if force or signature ~= F.lastBags then
         F.lastBags=signature
@@ -79,13 +84,28 @@ function F.ScanEquipment()
     local rows={}
     for slot=1,19 do
         local link=F.Call(GetInventoryItemLink,"player",slot)
-        if link then rows[#rows+1]={slot=slot,quantity=1,item=F.Item(link)} end
+        if link then
+            local loc=ItemLocation and ItemLocation:CreateFromEquipmentSlot(slot)
+            rows[#rows+1]={slot=slot,quantity=1,item=F.Item(link),bound=true,equipped=true,
+                guid=loc and C_Item and F.Call(C_Item.GetItemGUID,loc)}
+        end
     end
     F.Snapshot("equipment",rows,true)
 end
 
 function F.ScanAuctions()
     if not F.context.auction then return end
+    if F.LegacyAH and F.LegacyAH() and GetNumAuctionItems then
+        local count,total=F.Call(GetNumAuctionItems,"owner")
+        if not count then return end
+        local rows={}
+        for i=1,count do
+            local v={F.Call(GetAuctionItemInfo,"owner",i)}
+            rows[#rows+1]={item=F.Item(F.Call(GetAuctionItemLink,"owner",i),v[17],v[1]),
+                quantity=v[3],status=v[16],totalBuyout=v[10],bid=v[11],legacy=true}
+        end
+        F.Snapshot("auctions",rows,count==total,{legacy=true}); return
+    end
     local api=C_AuctionHouse
     local auctions=api and F.Call(api.GetOwnedAuctions)
     if not auctions then return end
@@ -93,8 +113,11 @@ function F.ScanAuctions()
     for _, a in ipairs(auctions) do
         local id=F.Number(a.auctionID)
         if id then
+            local item=F.Item(a.itemLink,a.itemKey and a.itemKey.itemID)
+            item.auctionItemKey=F.Copy(a.itemKey)
+            if F.TrackItem then F.TrackItem(item) end
             rows[#rows+1]={auctionID=id,auctionKey=F.AuctionKey(id),
-                item=F.Item(a.itemLink,a.itemKey and a.itemKey.itemID),
+                item=item,
                 quantity=F.Number(a.quantity),status=F.Number(a.status),
                 totalBuyout=F.Number(a.buyoutAmount),bid=F.Number(a.bidAmount),
                 secondsLeft=F.Number(a.timeLeftSeconds)}
@@ -358,7 +381,7 @@ F.events={
     end,
     CHAT_MSG_LOOT=function(text) F.Emit("loot_message",{text=text,location=F.Location()}) end,
     BAG_UPDATE_DELAYED=function() F.bagDirty=F.Clock() end,
-    PLAYER_EQUIPMENT_CHANGED=function() F.equipmentDirty=true end,
+    PLAYER_EQUIPMENT_CHANGED=function() F.equipmentDirty=true; F.bagDirty=F.Clock() end,
     BANKFRAME_OPENED=function() F.context.bank=true; F.ScanBank() end,
     BANKFRAME_CLOSED=function() F.context.bank=nil end,
     PLAYERBANKSLOTS_CHANGED=function() F.bankDirty=true end,
@@ -369,7 +392,8 @@ F.events={
         F.context.auction=true
         if C_AuctionHouse then F.Call(C_AuctionHouse.QueryOwnedAuctions,{}) end
     end,
-    AUCTION_HOUSE_CLOSED=function() F.context.auction=nil end,
+    AUCTION_HOUSE_CLOSED=function() F.context.auction=nil; if F.StopPrices then F.StopPrices("AH closed") end end,
+    AUCTION_OWNED_LIST_UPDATE=function() F.ScanAuctions() end,
     OWNED_AUCTIONS_UPDATED=function() F.ScanAuctions() end,
     AUCTION_HOUSE_AUCTION_CREATED=function(id) F.Created(id) end,
     AUCTION_HOUSE_POST_ERROR=function(...) F.pendingPosts={}; F.Emit("auction_post_failed",{}) end,

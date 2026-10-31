@@ -35,6 +35,11 @@ Every record contains:
 | `auction_return` | Returned item, quantity, expiration/cancellation and optional allocation |
 | `mail_sent`, `mail_collected` | Counterparty, money, items, postage/COD where available |
 | `snapshot` | Location, rows, completeness, location-specific metadata |
+| `price` | Realm/faction/client `scope`, variant `key`, item and quote (`price`, `updatedAt`, source, status) |
+| `valuation` | Account/scope `gold`, `assets`, `equipped`, `total`, `unpricedRows`, per-character subtotals/snapshot ages, model and fee assumption |
+| `professions` | Owner's observed Enchanting presence, skill and capability availability |
+| `price_scan_start`, `price_scan_end`, `price_scan_error` | Scan mode, progress and termination/failure reason |
+| `valuation_settings` | Estimated commission in basis points |
 | `loot_message`, `loot_money_message`, `quest_item` | Supporting activity evidence |
 | `session`, `logout`, `episode_start`, `episode_end`, `owner`, `account_label` | Lifecycle/configuration history |
 | `diagnostic`, `capability_missing` | Collector errors and unavailable interfaces |
@@ -55,7 +60,9 @@ Item report grouping uses item ID where available and otherwise item name. This 
 
 ## Database integration
 
-The SQLite `events.raw` field preserves the complete event JSON. `events.data` preserves the payload. Views supplied: `cash_movements`, `activities`, `reconciliation`, `auction_sales`, `auction_outcomes`, `snapshots`. Sources and ownership are stored separately.
+The SQLite `events.raw` field preserves the complete event JSON. `events.data` preserves the payload. Views supplied: `cash_movements`, `activities`, `reconciliation`, `auction_sales`, `auction_outcomes`, `snapshots`, `valuations`, `prices`. Sources and ownership are stored separately.
+
+Version 0.2 adds event families without rewriting schema-1 records. `markets` (catalog/prices by client, realm and faction) and `history` (chart samples) are SavedVariables caches. All new estimates are exported through immutable events. Item rows include `bound`, `equipped`, optional instance `guid` and a `valuation` as of the snapshot; later price events may change the current valuation without rewriting that snapshot. A valuation's `total` already includes gold, assets and equipped salvage. Do not stack or sum that total with those components, or sum historical samples. Latest account valuations remain separate by source/scope in reports; cross-account transfers can cause stale overlaps until both sides refresh.
 
 Import is append-only and transactional per input file. Repeated identical IDs are ignored. Different contents for an existing ID abort the file's import. Source sequence gaps are flagged in reports. Restoring an old SavedVariables backup and continuing to record can reuse IDs; preserve the conflicting files and investigate rather than editing away the conflict.
 

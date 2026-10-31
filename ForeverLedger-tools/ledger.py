@@ -197,6 +197,18 @@ def connect(path):
         json_extract(data,'$.location') AS location,
         json_extract(data,'$.complete') AS complete,data
         FROM events WHERE kind='snapshot';
+    CREATE VIEW IF NOT EXISTS valuations AS
+      SELECT id,source_id,time,episode,json_extract(data,'$.scope') AS scope,
+        json_extract(data,'$.gold') AS gold,json_extract(data,'$.assets') AS assets,
+        json_extract(data,'$.equipped') AS equipped,json_extract(data,'$.total') AS total,
+        json_extract(data,'$.unpricedRows') AS unpriced_rows,data
+        FROM events WHERE kind='valuation';
+    CREATE VIEW IF NOT EXISTS prices AS
+      SELECT id,source_id,time,json_extract(data,'$.scope') AS scope,
+        json_extract(data,'$.key') AS item_key,json_extract(data,'$.quote.price') AS unit_price,
+        json_extract(data,'$.quote.updatedAt') AS updated_at,
+        json_extract(data,'$.quote.source') AS price_source,data
+        FROM events WHERE kind='price';
     """)
     return db
 
@@ -243,6 +255,7 @@ def report(db, costs=None):
     owners = {r[0].casefold() for r in db.execute("SELECT name FROM owners")}
     balances, snapshots, items, unresolved, login_gaps = {}, {}, {}, [], []
     unmatched_returns, diagnostics = [], []
+    valuations = {}
     net, transfers, external_in, external_out, storage_transfers = 0, 0, 0, 0, 0
     attempts, outcomes, sales, cancel_fees = {}, {}, [], []
     def item_row(item):
@@ -283,6 +296,8 @@ def report(db, costs=None):
             unresolved.append({"event":e["id"],"residual":d["residual"]})
         elif k=="snapshot":
             snapshots[character+(d["location"],)]=e
+        elif k=="valuation":
+            valuations[(e["sourceID"],d["scope"])]=dict(source_id=e["sourceID"],time=e["time"],**d)
         elif k=="auction_posted":
             attempts[d["key"]]=e
             item_row(d.get("item") or {})["listings"]+=1
@@ -323,7 +338,8 @@ def report(db, costs=None):
         d=e["data"]
         summary={"character":e["characterName"],"location":d["location"],"time":e["time"],
             "complete":d["complete"],"vendor_value":0,"market_value":0,"unpriced_rows":0,
-            "active_asking_value":0,"sold_awaiting_delivery_gross":0,"mail_money":0,"rows":d["rows"]}
+            "active_asking_value":0,"sold_awaiting_delivery_gross":0,"mail_money":0,
+            "estimated_net_value":0,"rows":d["rows"]}
         for r in sequence(d["rows"]):
             if d["location"]=="auctions":
                 field="active_asking_value" if r.get("status")==0 else "sold_awaiting_delivery_gross"
@@ -340,7 +356,12 @@ def report(db, costs=None):
             else:
                 item=r.get("item",{})
                 summary["vendor_value"]+=(item.get("vendorPrice") or 0)*r.get("quantity",0)
-                if item.get("marketPrice") is not None:
+                if r.get("valuation") is not None:
+                    value=r["valuation"]
+                    summary["estimated_net_value"]+=value["value"]*r.get("quantity",0)
+                    summary["market_value"]+=value.get("marketGross",0)*r.get("quantity",0)
+                    if value.get("partial"): summary["unpriced_rows"]+=1
+                elif item.get("marketPrice") is not None:
                     summary["market_value"]+=item["marketPrice"]*r.get("quantity",0)
                 else:
                     summary["unpriced_rows"]+=1
@@ -355,7 +376,7 @@ def report(db, costs=None):
         "unresolved_reconciliation":unresolved,"login_gaps":login_gaps,"incomplete_imports":missing_sequences,
         "unmatched_auction_returns":unmatched_returns,"collector_diagnostics":diagnostics,
         "deposits_without_matched_outcome":unresolved_deposits,
-        "items":list(items.values()),"latest_snapshots":inventory,
+        "items":list(items.values()),"latest_snapshots":inventory,"latest_valuations":list(valuations.values()),
         "notes":["Gold changes and activities are two views of the same money; do not add them together.",
             "Internal-transfer net may be nonzero for gold in transit or missing account exports.",
             "Snapshot values are last observed and may overlap after movements; do not sum into exact net worth.",
@@ -367,7 +388,7 @@ def report(db, costs=None):
 def export_csv(db, folder):
     folder=Path(folder)
     folder.mkdir(parents=True,exist_ok=True)
-    for view in ("events","cash_movements","activities","reconciliation","auction_sales","auction_outcomes","snapshots"):
+    for view in ("events","cash_movements","activities","reconciliation","auction_sales","auction_outcomes","snapshots","valuations","prices"):
         cursor=db.execute(f"SELECT * FROM {view}")
         with (folder/(view+".csv")).open("w",encoding="utf-8",newline="") as out:
             writer=csv.writer(out)

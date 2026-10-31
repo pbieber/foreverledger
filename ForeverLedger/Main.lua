@@ -31,18 +31,21 @@ frame:SetScript("OnEvent",function(_,event,...)
                 realm=realm,build=tostring(version).."/"..tostring(build)})
             F.ObserveBalance(GetMoney())
             F.InstallHooks()
+            F.InstallPriceHooks()
             for e in pairs(F.events) do
                 local ok=pcall(frame.RegisterEvent,frame,e)
                 if not ok then F.Emit("capability_missing",{event=e}) end
             end
             F.ScanBags(true); F.ScanEquipment()
+            F.RecordValue(true)
             SLASH_FOREVERLEDGER1="/fl"; SLASH_FOREVERLEDGER2="/foreverledger"
             SlashCmdList.FOREVERLEDGER=function(msg) safe(F.Command,msg) end
             F.Print("Recording. /fl opens the ledger. /fl account Main labels this account.")
+            F.PromptMarker()
         end)
     elseif F.db then
         if event=="PLAYER_LOGOUT" then
-            safe(function() F.ObserveBalance(GetMoney(),F.context); F.Flush(); F.Emit("logout",{}) end)
+            safe(function() F.ObserveBalance(GetMoney(),F.context); F.Flush(); F.RecordValue(); F.Emit("logout",{}) end)
         elseif F.events[event] then safe(F.events[event],...) end
     end
 end)
@@ -60,5 +63,8 @@ frame:SetScript("OnUpdate",function(_,dt)
             F.Emit("diagnostic",{message="Mail action timed out",mail=F.pendingMail}); F.pendingMail=nil
         end
         if F.lastActivity and F.Clock()-F.lastActivity>2 then F.Flush(); F.lastActivity=nil end
+        F.PriceTick()
+        F.RecordValue()
+        if F.RefreshScanStatus and F.window and F.window:IsShown() then F.RefreshScanStatus() end
     end)
 end)

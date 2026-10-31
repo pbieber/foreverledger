@@ -1,4 +1,4 @@
-# Forever Ledger 0.1.0 — development preview
+# Forever Ledger 0.2.0 — development preview
 
 A standalone WoW Forever addon for recording gold movements, economic activity, inventory and auctions across a gold-making video series. A companion Python importer merges both accounts into one SQLite database and produces JSON reports and CSV tables.
 
@@ -10,10 +10,38 @@ Built on the assumption that the published Forever APIs and the interfaces used 
 2. Enable Forever Ledger on every character you want to record. If both accounts use the same game installation, installing the addon once is enough; each account keeps separate SavedVariables.
 3. On the main account run `/fl account Main`. On the second run `/fl account Bank`.
 4. Register characters across the accounts with `/fl own Character-Realm`. Use normalized realm names without spaces. Logged-in characters are registered automatically; the database combines ownership from both exports.
-5. Use `/fl episode Episode 1 - Starting out` before recording and `/fl end` afterwards. Set the same episode label on both accounts if you want their work grouped together.
+5. Login/reload asks for a recording marker if none is active. Enter an episode name, or choose **Not now** to continue recording without one. `/fl episode Episode 1 - Starting out` and the **Set marker** button also set it; `/fl end` clears it. Use the same label on both accounts to group their work.
 6. Open your bank, mailbox and the AH's owned-auctions view to populate those snapshots. `/fl scan` refreshes currently accessible locations. Information for offline characters is explicitly last-observed data.
 
-The addon does not buy, sell, mail, trade or cancel anything. It observes user actions and requests owned-auction data when the AH opens. No external network service is used.
+The addon does not buy, sell, mail, trade or cancel anything. It observes user actions, requests owned-auction data and performs market queries when you start a price scan. No external network service is used.
+
+## Try it in TBC Anniversary
+
+Yes: the package includes `ForeverLedger_TBC.toc` for interface **20506** (2.5.6), plus a legacy AH price-scanning adapter. Copy the same ForeverLedger folder into your Anniversary installation's `Interface/AddOns` directory. If your client has a different interface patch, enable **Load out of date AddOns** for testing. Keep Anniversary test exports in a separate database from your Forever series.
+
+Test gold changes, quests, vendors, trades, mail invoices, marker persistence, price scans, binding changes and the chart. This is a compatibility preview, **not a claim of live TBC validation**. TBC's legacy AH does not provide the Forever auction-ID creation/outcome path this collector uses: exact listing/deposit/return matching is not covered there. Raw wallet changes and available mail invoice fees are still captured. Outland and TBC item-level >60 disenchant estimates deliberately fall back to vendor value; the bundled model covers Forever-era loot. A TBC test cannot validate Forever-specific events.
+
+## History chart and item values
+
+The main menu has **Gold only**, **Total value** and **Equipped gear** presets. Individual checkboxes select gold, other assets and equipped salvage. Selected components stack cumulatively; total value is the sum of those components, never a fourth series. Hover the chart for values. It displays the latest 300 observations on a time axis; all observations remain in the export. History starts with this version and is not retroactively repriced.
+
+- **Gold:** last observed wallets on this account, realm and faction.
+- **Other assets:** bag/bank items, active AH items and observed non-COD mailbox contents/money. Active auctions use item estimates; their asking prices are shown separately in the summary.
+- **Equipped salvage:** vendor or eligible expected disenchant proceeds for equipped gear.
+
+An unbound item uses the highest of vendor price, auction price after commission, and expected disenchant material value after commission. This includes the requested `max(vendor, DE net)` floor. Tradable DE assumes access to an enchanter; no service charge is assumed. Equipped/soulbound items never receive an auction-item value. Their DE option requires Enchanting on the **owning character** (and sufficient modeled skill in TBC). Unequipping a soulbound item does not restore its auction value. Unknown binding falls back conservatively to vendor value.
+
+DE is a probabilistic model, not guaranteed loot. Every possible material must have a price; incomplete/unsupported DE estimates are flagged and use the available alternatives. Prices are copper per item. The default estimated commission is 5%; `/fl fee 15` changes it for neutral-AH estimates, and `/fl fee 5` restores it. This only changes estimates, never recorded invoice fees. Estimates exclude future failed-listing deposits, unknown service costs and time to sell.
+
+## Refresh prices
+
+Open the AH, then use the menu buttons or:
+
+- `/fl prices all`: query every tracked item variant and the materials needed for its DE estimate.
+- `/fl prices oldest`: query **all unpriced items plus the 50 priced items with the oldest price timestamps**. Unknown-age quotes sort first.
+- `/fl prices stop`: stop safely; completed observations remain saved.
+
+The tracked catalog consists of item types seen by the addon, including previously held stock. This is not a scan of every item in WoW. There is no Auctionator dependency. Its optional cached prices can seed missing estimates, preserving its reported age (or unknown age), but a refresh uses actual AH queries. The scan follows result pages, waits for throttling, and stops on timeout, AH close or another search. Avoid browsing/scanning with another addon while it runs. Complete no-buyout results remove stale quotes and leave items unpriced for the next run; failed queries preserve existing quotes.
 
 ## Commands and display
 
@@ -25,6 +53,8 @@ The addon does not buy, sell, mail, trade or cancel anything. It observes user a
 | `/fl episode My episode` | Begin an episode label |
 | `/fl end` | Finish the episode |
 | `/fl scan` | Record bags, accessible bank/mail/auctions |
+| `/fl prices all`, `/fl prices oldest`, `/fl prices stop` | Market price scan controls |
+| `/fl fee 5` | Assumed AH commission percentage for valuations |
 | `/fl journal` | Inspect the most recent 50 raw records |
 | `/fl export 1` | Copy JSON export page 1, 50 records per page |
 
@@ -61,7 +91,8 @@ Alternatively, copy each `/fl export <page>` into a UTF-8 JSON file and import t
 - Vendor purchase/sale/buyback intents, junk-selling intents, repairs, flights and training. A matching balance change is required before these become classified activities, with a correlation label rather than a false claim of server-confirmed causality.
 - Confirmed auction postings, deposits, server auction IDs, exact cancellation/expiration events when provided, sale invoices, commission, returned deposits and auction return evidence.
 - Bags, equipment, accessible character bank, visible mailbox and owned-auction snapshots. Partial mailbox/AH results are marked partial. Items carry item links/IDs and vendor values when available.
-- Optional Auctionator price observations for item estimates. Missing prices remain unpriced; an observation timestamp is not the underlying Auctionator scan timestamp. No market scan is initiated by this addon.
+- Market price observations with source, scan time and missing-price status; optional Auctionator quotes preserve reported age.
+- Immutable valuation history, item binding/equipment state, owner profession observations and estimated net liquidation values.
 
 ## Read the financial results correctly
 
@@ -99,7 +130,7 @@ Pass `--unit-costs costs.json` to add `profit_at_supplied_unit_cost`. This is an
 
 **Auction matching:** server-ID outcomes are distinguished from inferred unique matches and FIFO allocations. Auction mail does not expose an auction ID. Multiple identical lots can therefore require allocation. Partial-stack/aggregated sales that cannot be matched remain unmatched; their reported proceeds, commission and refund are still recorded. Vendor/market prices and copied item links do not prove which farming session produced an item.
 
-**Inventory valuation:** last-observed snapshots are not a synchronized world state. An item can appear in an old bank/mail snapshot and a newer bag snapshot after being moved. The tool intentionally does not produce a supposedly exact combined net-worth figure from those snapshots. Equipment is separate from saleable stock, and bound/unpriced items should not be treated as auction inventory. Asking prices are not guaranteed sale prices. Mail money and sold-auction snapshots may refer to the same proceeds.
+**Inventory valuation:** chart totals are estimates from last-observed snapshots, not a synchronized world state. When available, instance GUIDs deduplicate overlapping storage observations. Without them, stale bank/mail/AH snapshots can overlap with bags after movements; opening those locations refreshes them. Offline characters remain stale. Pending sold-AH proceeds and refundable deposits are not counted until observed in mail/wallets, so transfers can temporarily lower the estimate. Snapshot timestamps/completeness and partially priced rows remain visible/exported. Revisit every character after upgrading from 0.1 to establish its realm/faction valuation scope. The chart covers the local account; use the database to combine both accounts.
 
 **Scope:** character wallets and accessible character storage are covered. Guild/warband holdings, detailed crafting material transformations, automatic acquisition-lot provenance and in-game cross-account synchronization are not implemented. Unusual purchase/refund paths, drag-to-vendor sales and repairs not caught by a specific hook still appear in wallet changes but may need manual attribution. The tool does not claim a retrospective, complete history.
 
@@ -117,6 +148,8 @@ python -m unittest discover -s .\ForeverLedger-tools\tests -v
 API reference: [published Forever UI/API source](https://github.com/Gethe/wow-ui-source/tree/ca8368f2f2380cbe696854f7f2646387c278a61b), particularly `AuctionHouseDocumentation.lua`, `ContainerDocumentation.lua`, `MailInfoDocumentation.lua` and `TradeInfoDocumentation.lua`.
 
 Event-handling reference: [Journalator source](https://github.com/TheMouseNest/Journalator/tree/c6166ead2801d93cde0dbb1d09b0410ad4316b8d). This package is a separate implementation; Journalator is not bundled.
+
+TBC adapter reference: [Anniversary Blizzard UI source](https://github.com/Gethe/wow-ui-source/tree/68e0a2ec559d9761dfc4e7f864c3944f9d758a49), particularly `Blizzard_AuctionUI/Classic/Blizzard_AuctionUI.lua`. Disenchant model adapted from [Mailworthy](https://github.com/sjdodge123/mailworthy/blob/main/Mailworthy/Disenchant.lua), with its MIT notices in `ForeverLedger/THIRD_PARTY.txt`.
 
 ## Repository workflow
 
