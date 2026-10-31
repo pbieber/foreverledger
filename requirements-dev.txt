@@ -1,0 +1,2 @@
+# Only needed for Lua tests; the production importer is stdlib-only.
+lupa==2.8

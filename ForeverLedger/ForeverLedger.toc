@@ -1,0 +1,11 @@
+## Interface: 16001
+## Title: Forever Ledger
+## Notes: Auditable gold, inventory and auction records for WoW Forever.
+## Author: Peter
+## Version: 0.1.0
+## SavedVariables: ForeverLedgerDB
+## OptionalDeps: Auctionator
+Core.lua
+Collectors.lua
+UI.lua
+Main.lua

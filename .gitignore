@@ -1,0 +1,15 @@
+# Local runtime and generated packages
+.venv/
+__pycache__/
+*.py[cod]
+dist/
+.pytest_cache/
+# Gameplay data must remain local
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+report.json
+csv/
+SavedVariables/
+*.lua.bak

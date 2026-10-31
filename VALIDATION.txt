@@ -1,0 +1,9 @@
+Forever Ledger 0.1.0
+Validated 2026-10-31
+
+54 automated tests passed with no skips.
+Runtime: Python 3.10; lupa 2.8 Lua 5.1.
+Actual Lua collectors/core plus mocked game APIs; real SQLite import/report tests.
+Importer CLI smoke test passed (SQLite, JSON report and CSV export).
+Live WoW Forever and native UI rendering: NOT TESTED (client unavailable).
+See TESTING.md for coverage and the first-client checklist.
