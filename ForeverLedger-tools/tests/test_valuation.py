@@ -331,6 +331,31 @@ class ValuationTests(unittest.TestCase):
         self.assertEqual(values[1]['equipped'],100)
         self.assertEqual(values[1]['assets'],0)
 
+    def test_unchanged_rescans_record_nothing(self):
+        self.run_lua('''
+        GetInventoryItemLink=function(_,slot) if slot==16 then return "item:999" end end
+        F.ScanEquipment(); F.ScanBags(); F.RecordValue(true)
+        F.events.GET_ITEM_INFO_RECEIVED(); FIRST=F.bagDirty; CLOCK=0.4; F.events.GET_ITEM_INFO_RECEIVED(); SECOND=F.bagDirty
+        NOW=NOW+10; F.ScanEquipment(); F.ScanBags(); F.ScanBags(true); F.bagDirty=nil; F.equipmentDirty=nil; F.RecordValue()
+        ''')
+        self.assertEqual(self.run_lua('return SECOND'),0)
+        locations=[s["location"] for s in self.kind("snapshot")]
+        self.assertEqual(locations.count("equipment"),1)
+        self.assertEqual(locations.count("bags"),2)
+        self.assertEqual(len(self.kind("valuation")),1)
+
+    def test_partial_commodity_results_priced_without_paging(self):
+        self.scanner()
+        self.run_lua('FULL=false; RESULTS={{unitPrice=200},{unitPrice=300}}; F.StartPrices("all"); F.PriceTick(); F.PriceResults("commodity",2770)')
+        self.assertEqual(self.kind('price')[0]['quote']['price'],200)
+        self.assertEqual(self.run_lua('return #SENT'),1)
+
+    def test_price_queue_skips_unlistable_items(self):
+        self.run_lua('F.TrackItem({id=5000,name="Quest Thing",link="item:5000",bindType=4}); F.TrackItem({id=5001,name="Ore",link="item:5001",bindType=0})')
+        keys=[e["key"] for e in self.result('F.PriceQueue("all")')]
+        self.assertIn("5001:0",keys)
+        self.assertNotIn("5000:0",keys)
+
     def test_schema_one_upgrade_preserves_existing_events(self):
         self.run_lua('''
         F.Emit("old",{amount=123}); local db=F.db

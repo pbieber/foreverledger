@@ -73,7 +73,7 @@ function F.Init(db, identity)
     F.character = db.characters[identity.guid] or {name=identity.name, realm=identity.realm}
     db.characters[identity.guid] = F.character
     F.character.snapshots = F.character.snapshots or {}
-    F.batch, F.intents = {balances={}, claims={}}, {}
+    F.batch, F.intents, F.lastSnapshot = {balances={}, claims={}}, {}, {}
     F.session = F.Emit("session", {version=F.VERSION, build=identity.build}).id
     if F.InitValuation then F.InitValuation() end
 end
@@ -177,8 +177,13 @@ function F.Flush()
     F.intents = keep
 end
 
-function F.Snapshot(location, rows, complete, extra)
+function F.Snapshot(location, rows, complete, extra, force)
     rows=F.Copy(rows)
+    -- Rescans fire far more often than contents change; record only changes.
+    -- Only persistent item facts participate, not the derived valuation.
+    local signature = F.JSON({rows=rows, complete=complete, metadata=extra})
+    if not force and F.lastSnapshot[location] == signature then return end
+    F.lastSnapshot[location] = signature
     if F.ValueRow then
         for _,row in ipairs(rows) do
             if row.item and (location=="bags" or location=="equipment" or location=="bank") then

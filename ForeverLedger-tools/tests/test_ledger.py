@@ -84,7 +84,7 @@ function GetInboxItem(i,s)
 end
 TakeInboxMoney=noop; AutoLootMailItem=noop; TakeInboxItem=noop; SendMail=noop
 function GetSendMailMoney() return 10000 end
-function GetSendMailPrice() return 10030 end
+function GetSendMailPrice() return 30 end
 function GetSendMailCOD() return 0 end
 function GetSendMailItemLink() return nil end
 function GetTargetTradeMoney() return 2000 end
@@ -205,6 +205,37 @@ class AddonTests(unittest.TestCase):
         self.assertEqual(len(self.kind("auction_posted")),1)
         self.assertEqual(self.kind("activity")[0]["amount"],-5000)
 
+    def test_warned_post_confirmed_once(self):
+        self.run_lua('''
+        F.InstallHooks(); C_AuctionHouse.PostItem({link="item:2770"},1,1,0,100000)
+        F.events.AUCTION_HOUSE_POST_WARNING(); CLOCK=2
+        C_AuctionHouse.ConfirmPostItem({link="item:2770"},1,1,0,100000); F.Created(55)
+        CLOCK=5; C_AuctionHouse.PostItem({link="item:999"},1,1,0,7000); F.Created(56)
+        ''')
+        posted=self.kind("auction_posted")
+        self.assertEqual([p["totalPrice"] for p in posted],[100000,7000])
+        self.assertEqual(len(self.kind("auction_post_intent")),2)
+
+    def test_cancelled_warning_does_not_shift_queue(self):
+        self.run_lua('''
+        F.InstallHooks(); C_AuctionHouse.PostItem({link="item:2770"},1,1,0,100000)
+        F.events.AUCTION_HOUSE_POST_WARNING(); CLOCK=5
+        C_AuctionHouse.PostItem({link="item:999"},1,1,0,7000); F.Created(56)
+        ''')
+        self.assertEqual(self.kind("auction_posted")[0]["item"]["link"],"item:999")
+
+    def test_multisell_splits_quantity_and_deposit(self):
+        self.run_lua('''
+        CalculateDeposit=C_AuctionHouse.CalculateItemDeposit
+        C_AuctionHouse.CalculateItemDeposit=function() return 5003 end
+        F.InstallHooks(); C_AuctionHouse.PostItem({link="item:2770"},1,3,0,100000)
+        F.events.AUCTION_MULTISELL_START(3); F.Created(55); CLOCK=20; F.Created(56); CLOCK=40; F.Created(57)
+        ''')
+        posted=self.kind("auction_posted")
+        self.assertEqual([p["quantity"] for p in posted],[1,1,1])
+        self.assertEqual([p["deposit"] for p in posted],[1667,1668,1668])
+        self.assertTrue(all(p["item"]["link"]=="item:2770" for p in posted))
+
     def test_commodity_price_is_total(self):
         self.run_lua('F.InstallHooks(); C_AuctionHouse.PostCommodity({link="item:2770"},1,20,100); F.Created(55)')
         self.assertEqual(self.kind("auction_posted")[0]["totalPrice"],2000)
@@ -258,6 +289,15 @@ class AddonTests(unittest.TestCase):
         ''')
         self.assertEqual(len(self.kind("auction_sale")),1)
         self.assertEqual(self.kind("auction_sale")[0]["commission"],5000)
+
+    def test_stale_mail_cache_not_used_after_index_shift(self):
+        self.run_lua('''
+        INBOX={{sender="Alt-Realm",subject="Gold",money=100},{sender="Bank-Realm",subject="Rent",money=900}}
+        F.context.mail=true; F.ScanMail(); table.remove(INBOX,1)
+        F.TakeMail(1,"money"); F.MailSuccess(nil)
+        ''')
+        activity=self.kind("activity")[0]
+        self.assertEqual((activity["amount"],activity["sender"]),(900,"Bank-Realm"))
 
     def test_mail_failed_no_claim(self):
         self.run_lua('INBOX={{money=500}}; F.TakeMail(1,"money"); F.events.MAIL_FAILED(); F.MailSuccess(nil)')

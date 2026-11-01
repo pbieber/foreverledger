@@ -408,6 +408,7 @@ def main():
     costs=json.loads(Path(args.unit_costs).read_text(encoding="utf-8-sig")) if args.unit_costs else None
     db=connect(args.db)
     mtimes={}
+    changed=True
     try:
         while True:
             for filename in args.files:
@@ -417,10 +418,15 @@ def main():
                         continue
                     added=import_file(db,filename)
                     mtimes[filename]=stamp
+                    changed=changed or added>0
                     print(f"{filename}: {added} new records")
                 except (OSError,ValueError,KeyError,sqlite3.Error) as err:
                     if not args.watch: raise
                     print(f"Waiting for complete saved file: {filename}: {err}")
+            if not changed:
+                time.sleep(5)
+                continue
+            changed=False
             result=report(db,costs)
             if args.report:
                 Path(args.report).write_text(json.dumps(result,indent=2,ensure_ascii=False),encoding="utf-8")

@@ -160,7 +160,12 @@ function F.RecordValue(force)
         end
     end
     d.total=d.gold+d.assets+d.equipped
-    local signature=F.JSON(d)
+    -- Snapshot times change on every rescan; only values make a new sample.
+    local unstamped=F.Copy(d)
+    for _,cd in pairs(unstamped.characters) do
+        for _,s in pairs(cd.snapshots) do s.time=nil end
+    end
+    local signature=F.JSON(unstamped)
     if not force and signature==F.lastValue then return end
     F.lastValue=signature
     local e=F.Emit("valuation",d)
