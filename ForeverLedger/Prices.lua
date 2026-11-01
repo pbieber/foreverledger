@@ -4,6 +4,10 @@ function F.LegacyAH()
     return F.isTBC or not (C_AuctionHouse and C_AuctionHouse.SendSearchQuery)
 end
 
+-- Bind types that can never be listed: on pickup, quest, account and warband.
+-- Unknown (not yet loaded) bind types stay in the queue.
+local UNLISTABLE={[1]=true,[4]=true,[7]=true,[8]=true,[9]=true}
+
 function F.PriceQueue(mode)
     local catalog=F.market.catalog
     local materials={}
@@ -13,9 +17,11 @@ function F.PriceQueue(mode)
     for id in pairs(materials) do F.TrackItem(F.Item(nil,id)) end
     local missing,priced={},{}
     for key,item in pairs(catalog) do
-        local p=F.market.prices[key]
-        local entry={key=key,item=F.Copy(item),updatedAt=p and p.updatedAt or 0}
-        if not p or not p.price then missing[#missing+1]=entry else priced[#priced+1]=entry end
+        if not UNLISTABLE[item.bindType] then
+            local p=F.market.prices[key]
+            local entry={key=key,item=F.Copy(item),updatedAt=p and p.updatedAt or 0}
+            if not p or not p.price then missing[#missing+1]=entry else priced[#priced+1]=entry end
+        end
     end
     table.sort(missing,function(a,b) return a.key<b.key end)
     table.sort(priced,function(a,b) if a.updatedAt==b.updatedAt then return a.key<b.key end; return a.updatedAt<b.updatedAt end)
@@ -134,9 +140,11 @@ function F.PriceResults(kind,key)
             s.commodity=false
         else return end
         local arg=s.commodity and item.id or s.itemKey
-        local full=F.Call(s.commodity and api.HasFullCommoditySearchResults or api.HasFullItemSearchResults,arg)
-        if full~=true then s.more=true; s.pending=nil; return end
+        local full=F.Call(s.commodity and api.HasFullCommoditySearchResults or api.HasFullItemSearchResults,arg)==true
         local count=F.Call(s.commodity and api.GetNumCommoditySearchResults or api.GetNumItemSearchResults,arg)
+        -- Commodity results arrive cheapest first, so the loaded rows already hold
+        -- the minimum. Unsorted item results need every page.
+        if not full and (not s.commodity or (count or 0)==0) then s.more=true; s.pending=nil; return end
         if not count then return end
         local minimum
         for i=1,count do
@@ -167,4 +175,6 @@ F.events.ITEM_SEARCH_RESULTS_ADDED=function(key) F.PriceResults("item",key) end
 F.events.COMMODITY_SEARCH_RESULTS_UPDATED=function(id) F.PriceResults("commodity",id) end
 F.events.COMMODITY_SEARCH_RESULTS_ADDED=function(id) F.PriceResults("commodity",id) end
 F.events.SKILL_LINES_CHANGED=function() F.ScanProfession() end
-F.events.GET_ITEM_INFO_RECEIVED=function() F.bagDirty=F.Clock(); F.equipmentDirty=true end
+-- Keep the first dirty time: a stream of item-cache replies must not keep
+-- postponing the bag rescan. Unchanged rescans record nothing.
+F.events.GET_ITEM_INFO_RECEIVED=function() F.bagDirty=F.bagDirty or F.Clock(); F.equipmentDirty=true end

@@ -44,7 +44,9 @@ Every record contains:
 | `session`, `logout`, `episode_start`, `episode_end`, `owner`, `account_label` | Lifecycle/configuration history |
 | `diagnostic`, `capability_missing` | Collector errors and unavailable interfaces |
 
-`auction_posted.totalPrice` is a total for the posting. Commodity unit prices are multiplied by quantity; item-auction buyout amounts are already totals. Returned auction deposits are kept separate from commissions.
+`auction_posted.totalPrice` is a total for the posting. Commodity unit prices are multiplied by quantity; item-auction buyout amounts are already totals. A multisell posting creates one `auction_posted` per auction, each with its share of the quantity and deposit. Returned auction deposits are kept separate from commissions.
+
+A `snapshot` is written when a location's contents change, or on an explicit refresh; an unchanged rescan writes nothing. Likewise a `valuation` is written only when a value or snapshot completeness changes.
 
 An intent alone is not a transaction. Confirmed event activity can precede or follow `PLAYER_MONEY`; the collector waits for a two-second quiet window before writing a reconciliation record. A unique amount match becomes `correlated_amount`; an exact sum of multiple pending intents becomes `correlated_batch`. Neither is a server-confirmed cause. Ambiguous or stale candidates remain intents. Unresolved windows are retained even if later windows happen to offset them.
 

@@ -56,12 +56,7 @@ function F.ScanBags(force)
     local ids = {}
     for id=0,(NUM_TOTAL_EQUIPPED_BAG_SLOTS or NUM_BAG_SLOTS or 4) do ids[#ids+1]=id end
     local rows,complete = F.BagRows(ids)
-    -- Only persistent item facts participate in this signature.
-    local signature = F.JSON(rows)
-    if force or signature ~= F.lastBags then
-        F.lastBags=signature
-        F.Snapshot("bags",rows,complete)
-    end
+    F.Snapshot("bags",rows,complete,nil,force)
 end
 
 function F.ScanBank()
@@ -171,11 +166,21 @@ function F.ScanMail()
     F.Snapshot("mail",rows,#rows==count and (not total or count>=total),{visible=count,total=total})
 end
 
+-- Fields a take does not change, unlike money and attachments.
+local function mailIdentity(m)
+    return F.JSON({sender=m.sender,subject=m.subject,invoiceType=m.invoiceType,gross=m.gross,
+        counterparty=m.counterparty})
+end
+
 function F.TakeMail(index, mode, slot)
     -- Only one mail command is accepted at once by the client. Do not replace
     -- the first command's cached identity on repeated clicks.
     if F.pendingMail then return end
-    local mail=F.mailCache[index] or F.ReadMail(index)
+    -- Indices shift when a mail is deleted, and the cache is only rebuilt on the
+    -- next tick. Trust a cached entry only while it still describes this mail.
+    local live,cached=F.ReadMail(index),F.mailCache[index]
+    local mail=cached
+    if live and not (cached and mailIdentity(cached)==mailIdentity(live)) then mail=live end
     if not mail then return end
     mail=F.Copy(mail)
     mail.mode,mail.slot,mail.started=mode,slot,F.Clock()
@@ -237,7 +242,7 @@ local function Hook(tableOrName, nameOrFn, fn)
     end
 end
 
-function F.CapturePost(location,duration,quantity,bid,buyout,commodity)
+function F.CapturePost(location,duration,quantity,bid,buyout,commodity,confirm)
     local link=F.Call(C_Item and C_Item.GetItemLink,location)
     local item=F.Item(link)
     local api=C_AuctionHouse
@@ -247,32 +252,60 @@ function F.CapturePost(location,duration,quantity,bid,buyout,commodity)
     local d={item=item,duration=duration,quantity=F.Number(quantity),deposit=F.Number(deposit),
         totalPrice=commodity and (F.Number(buyout) or 0)*(F.Number(quantity) or 0) or F.Number(buyout),
         bid=F.Number(bid),commodity=commodity,clock=F.Clock()}
+    local function same(p) return p.item.link==d.item.link and p.quantity==d.quantity and p.totalPrice==d.totalPrice end
+    -- A Confirm* call completes a warned post; it is the same auction, not another one.
+    if confirm then
+        for i=#F.pendingPosts,1,-1 do
+            local p=F.pendingPosts[i]
+            if same(p) then p.awaitingConfirm=nil; p.clock=d.clock; return end
+        end
+    end
     local last=F.pendingPosts[#F.pendingPosts]
-    if last and d.clock-last.clock<0.2 and last.item.link==d.item.link and
-        last.quantity==d.quantity and last.totalPrice==d.totalPrice then return end
+    if last and d.clock-last.clock<0.2 and same(last) then return end
     F.pendingPosts[#F.pendingPosts+1]=d
     F.Emit("auction_post_intent",d)
 end
 
+-- One multisell call creates `multisell` separate auctions sharing the quantity
+-- and deposit; rounding remainders fall to the later auctions.
+local function nextAuction(d)
+    local n=d.multisell
+    d.multisell=nil
+    if not n or n<2 then return d,true end
+    local one=F.Copy(d)
+    one.quantity=d.quantity and math.floor(d.quantity/n)
+    one.deposit=d.deposit and math.floor(d.deposit/n)
+    d.quantity=d.quantity and d.quantity-one.quantity
+    d.deposit=d.deposit and d.deposit-one.deposit
+    d.multisell=n-1; d.clock=F.Clock()
+    return one,false
+end
+
 function F.Created(id)
     if F.db.auctions[F.AuctionKey(id)] then return end
-    local candidates={}
-    for _, d in ipairs(F.pendingPosts) do
-        if F.Clock()-d.clock<30 then candidates[#candidates+1]=d end
+    local keep,d={},nil
+    for _, p in ipairs(F.pendingPosts) do
+        if F.Clock()-p.clock<30 then
+            -- A post waiting on its warning dialog has not created anything yet.
+            if not d and not p.awaitingConfirm then d=p else keep[#keep+1]=p end
+        end
     end
-    local d=table.remove(candidates,1)
-    F.pendingPosts=candidates
-    if d then d.clock=nil; d.matchConfidence="ordered_confirmation" end
+    if d then
+        local post,last=nextAuction(d)
+        if not last then table.insert(keep,1,d) end
+        d=post; d.clock=nil; d.matchConfidence="ordered_confirmation"
+    end
+    F.pendingPosts=keep
     F.Posted(id,d)
 end
 
 function F.InstallHooks()
     local api=C_AuctionHouse
-    for _, name in ipairs({"PostItem","ConfirmPostItem"}) do
-        Hook(api,name,function(loc,d,q,b,p) F.CapturePost(loc,d,q,b,p,false) end)
+    for _, def in ipairs({{"PostItem",false},{"ConfirmPostItem",true}}) do
+        Hook(api,def[1],function(loc,d,q,b,p) F.CapturePost(loc,d,q,b,p,false,def[2]) end)
     end
-    for _, name in ipairs({"PostCommodity","ConfirmPostCommodity"}) do
-        Hook(api,name,function(loc,d,q,p) F.CapturePost(loc,d,q,nil,p,true) end)
+    for _, def in ipairs({{"PostCommodity",false},{"ConfirmPostCommodity",true}}) do
+        Hook(api,def[1],function(loc,d,q,p) F.CapturePost(loc,d,q,nil,p,true,def[2]) end)
     end
     Hook(api,"PlaceBid",function(id,amount)
         F.Intent("auction_purchase_or_bid",-amount,{auctionID=id})
@@ -292,9 +325,9 @@ function F.InstallHooks()
     Hook("SendMail",function(recipient)
         if F.pendingSend then return end
         local money=F.Number(F.Call(GetSendMailMoney)) or 0
-        local price=F.Number(F.Call(GetSendMailPrice))
+        -- GetSendMailPrice is postage only; the send frame adds the money on top.
         local d={recipient=F.FullName(recipient),money=money,cod=F.Number(F.Call(GetSendMailCOD)),
-            postage=price and price-money or nil,items={}}
+            postage=F.Number(F.Call(GetSendMailPrice)),items={}}
         for i=1,(ATTACHMENTS_MAX_SEND or 12) do
             local link=F.Call(GetSendMailItemLink,i)
             if link then
@@ -398,6 +431,15 @@ F.events={
     AUCTION_HOUSE_AUCTION_CREATED=function(id) F.Created(id) end,
     AUCTION_HOUSE_POST_ERROR=function(...) F.pendingPosts={}; F.Emit("auction_post_failed",{}) end,
     AUCTION_MULTISELL_FAILURE=function() F.pendingPosts={} end,
+    AUCTION_MULTISELL_START=function(count)
+        local d=F.pendingPosts[#F.pendingPosts]
+        count=F.Number(count)
+        if d and count and count>1 then d.multisell=count end
+    end,
+    AUCTION_HOUSE_POST_WARNING=function()
+        local d=F.pendingPosts[#F.pendingPosts]
+        if d then d.awaitingConfirm=true end
+    end,
     AUCTION_CANCELED=function(id) F.AuctionOutcome(F.AuctionKey(id),"cancelled","server_id") end,
     AUCTION_HOUSE_AUCTIONS_EXPIRED=function(id) F.AuctionOutcome(F.AuctionKey(id),"expired","server_id") end,
     COMMODITY_PRICE_UPDATED=function(unit,total) F.commodityQuote={unit=F.Number(unit),total=F.Number(total)} end,
