@@ -696,6 +696,30 @@ class ValuationTests(unittest.TestCase):
         self.assertEqual(self.run_lua('return F.intents[#F.intents].event.data.amount'),-500)
         self.assertEqual(self.run_lua('return F.intents[#F.intents].event.data.details.quantity'),20)
 
+    def buy_from_merchant(self, setup):
+        self.run_lua('''
+        local hooks={}
+        function hooksecurefunc(name,fn) hooks[name]=fn end
+        function BuyMerchantItem() end
+        function GetMerchantItemLink() return nil end
+        function GetMerchantItemID() return 2321 end
+        ''' + setup + '''
+        F.InstallHooks()
+        hooks.BuyMerchantItem(3,4)
+        ''')
+        data=lambda field: self.run_lua('return F.intents[#F.intents].event.data.'+field)
+        return data("category"),data("amount"),data("details.quantity"),data("details.item.id"),data("details.item.name")
+
+    def test_a_vendor_buy_on_a_newer_client_reads_the_merchant_frame(self):
+        got=self.buy_from_merchant('C_MerchantFrame={GetItemInfo=function(i) assert(i==3) '
+                                   'return {name="Fine Thread",price=100,stackCount=1} end}')
+        self.assertEqual(got,("vendor_purchase",-400,4,2321,"Fine Thread"))
+
+    def test_a_vendor_buy_on_an_older_client_reads_the_merchant_item(self):
+        got=self.buy_from_merchant('C_MerchantFrame={}; '
+                                   'function GetMerchantItemInfo() return "Fine Thread",nil,500,5 end')
+        self.assertEqual(got,("vendor_purchase",-400,4,2321,"Fine Thread"))
+
     def post_setup(self,deposit=30):
         self.run_lua('''
         HOOKS={}

@@ -39,7 +39,9 @@ PROFESSION_PREFIXES = ("Apprentice ", "Journeyman ", "Expert ", "Artisan ", "Mas
 TRAINER_VISIT_SECONDS = 10
 ITEM_LINK = re.compile(r"\|Hitem:(\d+)[^|]*\|h\[([^\]]*)\]\|h\|r(?:x(\d+))?")
 # What the English client says when the recording character itself gains an item.
-FARMED_PREFIX, CRAFTED_PREFIX = "You receive loot: ", "You create: "
+FARMED_PREFIX, CRAFTED_PREFIX, RECEIVED_PREFIX = "You receive loot: ", "You create: ", "You receive item: "
+# How far a "You receive item" line may be from the gold it cost at a merchant.
+MERCHANT_LINE_SECONDS = 2
 ITEM_SOLD = {"auction_sale": "auction", "vendor_sale": "vendor"}
 ITEM_BOUGHT = {"auction_purchase": "auction", "auction_purchase_or_bid": "auction", "vendor_purchase": "vendor"}
 OUTBID_PREFIX = "Outbid on "
@@ -492,6 +494,53 @@ def _names_by_id(db):
     return names
 
 
+def _unrecorded_vendor_buys(db):
+    """Vendor buys recorded only as gold leaving at a merchant: (time, item ID, name, quantity, copper).
+
+    Before the addon read Forever's merchant interface, a buy there made no intent, so
+    its gold change was left unresolved. Each "You receive item" line goes with the
+    character's nearest spend at a merchant, a second or two away at most. An
+    unresolved reconciliation whose every gold change was such a spend, and whose lines
+    all name one item, is a buy of that many for its unexplained gold. Lines nearest a
+    spend that is already explained, and anything mixed, are left alone.
+    """
+    spends = {}  # (source, character) -> [(time, balance ID)]
+    for event_id, source, character, moment, data in db.execute(
+            "SELECT id,source_id,character,time,data FROM events WHERE kind='balance'"):
+        d = json.loads(data)
+        if (d.get("delta") or 0) < 0 and (d.get("context") or {}).get("merchant"):
+            spends.setdefault((source, character), []).append((moment, event_id))
+    owner = {}  # balance ID -> index of the unresolved reconciliation it belongs to
+    unresolved = []
+    for source, character, data in db.execute(
+            "SELECT source_id,character,data FROM events WHERE kind='reconciliation' "
+            "AND json_extract(data,'$.status')='unresolved' ORDER BY time,source_id,sequence"):
+        d = json.loads(data)
+        known = {event_id for _, event_id in spends.get((source, character), [])}
+        ids = d.get("balanceIDs") or []
+        if (d.get("residual") or 0) < 0 and ids and all(i in known for i in ids):
+            owner.update((i, len(unresolved)) for i in ids)
+            unresolved.append({"time": 0, "cost": -d["residual"], "lines": []})
+    if not unresolved:
+        return []
+    for source, character, moment, data in db.execute(
+            "SELECT source_id,character,time,data FROM events WHERE kind='loot_message' ORDER BY time,source_id,sequence"):
+        text = json.loads(data).get("text") or ""
+        match = ITEM_LINK.search(text) if text.startswith(RECEIVED_PREFIX) else None
+        near = [(abs(moment - t), t > moment, t, i) for t, i in spends.get((source, character), [])
+                if abs(moment - t) <= MERCHANT_LINE_SECONDS]
+        if not match or not near:
+            continue
+        _, _, spent_at, balance = min(near)  # The nearest, and on a tie the spend before the line.
+        if balance in owner:
+            buy = unresolved[owner[balance]]
+            buy["time"] = max(buy["time"], spent_at)
+            buy["lines"].append((int(match.group(1)), match.group(2), int(match.group(3) or 1)))
+    return [(buy["time"], buy["lines"][0][0], buy["lines"][0][1], sum(q for _, _, q in buy["lines"]), buy["cost"])
+            for buy in unresolved
+            if buy["lines"] and len({i for i, _, _ in buy["lines"]}) == 1 and buy["lines"][0][1]]
+
+
 class ItemLedger:
     """Each item's sales, purchases, loot and crafts over all recorded history, by name.
 
@@ -536,6 +585,9 @@ class ItemLedger:
                 bid["refunded"] = True
         for record in self.records.values():
             record["bought"] = [b for b in record["bought"] if not b.get("refunded")]
+        for moment, item_id, name, quantity, cost in _unrecorded_vendor_buys(db):
+            self._record(name, {"id": item_id})["bought"].append(
+                {"time": moment, "kind": "vendor", "quantity": quantity, "cost": cost, "inferred": True})
 
         for source, character, sequence, moment, data in db.execute(
                 "SELECT source_id,character,sequence,time,data FROM events WHERE kind='loot_message' "
@@ -716,7 +768,8 @@ class ItemLedger:
             "gained": {"farmed": sum(f["quantity"] for f in inside["farmed"]),
                        "crafted": sum(c["quantity"] for c in crafts), "crafts": len(crafts),
                        "bought": sum(b["quantity"] or 0 for b in inside["bought"]),
-                       "unknown_purchases": sum(1 for b in inside["bought"] if not b["quantity"])},
+                       "unknown_purchases": sum(1 for b in inside["bought"] if not b["quantity"]),
+                       "inferred_purchases": sum(1 for b in inside["bought"] if b.get("inferred"))},
             "spent": {"bought": bought_cost, "purchases": len(inside["bought"]), "materials": materials,
                       "total": bought_cost + materials},
             "recipe": None if not recipe else {"makes": recipe["makes"], "seen": recipe["seen"], "reagents": reagents},

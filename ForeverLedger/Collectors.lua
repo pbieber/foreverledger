@@ -524,6 +524,16 @@ function F.Created(id)
     F.Posted(id,d)
 end
 
+-- A merchant item's price, stack size and name. Newer clients, Forever among them,
+-- moved these into C_MerchantFrame.GetItemInfo, which returns a table, and dropped
+-- GetMerchantItemInfo, so a buy there used to leave no record of what was bought.
+function F.MerchantItem(index)
+    local info=C_MerchantFrame and F.Call(C_MerchantFrame.GetItemInfo,index)
+    if type(info)=="table" then return F.Number(info.price),F.Number(info.stackCount),info.name end
+    local v={F.Call(GetMerchantItemInfo,index)}
+    return F.Number(v[3]),F.Number(v[4]),v[1]
+end
+
 function F.InstallHooks()
     local api=C_AuctionHouse
     for _, def in ipairs({{"PostItem",false},{"ConfirmPostItem",true}}) do
@@ -604,10 +614,10 @@ function F.InstallHooks()
         F.Intent("vendor_sale",total,{items=items,method="sell_junk"})
     end)
     Hook("BuyMerchantItem",function(index,quantity)
-        local v={F.Call(GetMerchantItemInfo,index)}
-        local price,stack=F.Number(v[3]),F.Number(v[4])
+        local price,stack,name=F.MerchantItem(index)
+        local link=F.Call(GetMerchantItemLink,index) or (C_MerchantFrame and F.Call(C_MerchantFrame.GetItemLink,index))
         if price and stack and stack>0 then F.Intent("vendor_purchase",-math.floor(price*(quantity or 1)/stack),
-            {item=F.Item(F.Call(GetMerchantItemLink,index)),quantity=quantity or 1}) end
+            {item=F.Item(link,F.Call(GetMerchantItemID,index),name),quantity=quantity or 1}) end
     end)
     Hook("BuybackItem",function(index)
         local v={F.Call(GetBuybackItemInfo,index)}

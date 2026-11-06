@@ -1019,7 +1019,8 @@ export function tableFor(kind, data) {
       ["Farmed", number.format(gained.farmed), "", "Looted by your own characters"],
       ["Crafted", number.format(gained.crafted), "", plural(gained.crafts, "craft", "crafts")],
       ["Bought", number.format(gained.bought), money(spent.bought), [plural(spent.purchases, "purchase", "purchases"),
-        gained.unknown_purchases ? `${gained.unknown_purchases} with no quantity on record` : ""].filter(Boolean).join(", ")],
+        gained.unknown_purchases ? `${gained.unknown_purchases} with no quantity on record` : "",
+        gained.inferred_purchases ? `${gained.inferred_purchases} read from gold spent at a vendor` : ""].filter(Boolean).join(", ")],
       ...(gained.crafts ? [["Materials to craft it", "", money(spent.materials), d.recipe
         ? `Recipe read from ${plural(d.recipe.seen, "craft", "crafts")}, making ${d.recipe.makes} each`
         : "Recipe not seen: no bag snapshot showed a clean craft"]] : []),

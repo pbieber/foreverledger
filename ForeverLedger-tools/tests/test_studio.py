@@ -860,6 +860,46 @@ class ItemAnalysisTests(StudioTestCase):
         self.loot(e, ORE, 2500, 6)
         self.assertEqual(self.analyse(e, "Ore")["gained"]["farmed"], 7)
 
+    @staticmethod
+    def merchant_spend(e, before, after, at, merchant=True):
+        return e.add("balance", {"before": before, "after": after, "delta": after - before,
+                                 "context": {"merchant": True} if merchant else {}}, at)
+
+    @staticmethod
+    def unresolved(e, balances, residual, at, status="unresolved"):
+        e.add("reconciliation", {"balanceIDs": balances, "activityIDs": {}, "observed": residual,
+                                 "explained": 0 if status == "unresolved" else residual,
+                                 "residual": residual if status == "unresolved" else 0, "status": status}, at)
+
+    def test_vendor_buys_with_no_record_are_read_from_gold_spent_at_a_merchant(self):
+        e = Events()
+        thread = (2321, "Fine Thread")
+        first = self.merchant_spend(e, 1000, 800, 1100)
+        self.loot(e, thread, 1100, text="You receive item: ")
+        self.loot(e, thread, 1101, text="You receive item: ")
+        second = self.merchant_spend(e, 800, 500, 1102)
+        self.loot(e, thread, 1102, 3, text="You receive item: ")
+        self.unresolved(e, [first], -200, 1104)
+        self.unresolved(e, [second], -300, 1105)
+        found = self.analyse(e, "Fine Thread")
+        self.assertEqual((found["gained"]["bought"], found["spent"]["bought"]), (5, 500))
+        self.assertEqual((found["spent"]["purchases"], found["gained"]["inferred_purchases"]), (2, 2))
+
+    def test_gold_spent_away_from_a_merchant_or_on_mixed_items_is_not_a_buy(self):
+        e = Events()
+        thread, vial = (2321, "Fine Thread"), (3371, "Empty Vial")
+        postage = self.merchant_spend(e, 1000, 970, 1100, merchant=False)
+        self.loot(e, thread, 1100, text="You receive item: ")
+        self.unresolved(e, [postage], -30, 1102)
+        mixed = self.merchant_spend(e, 970, 800, 1200)
+        self.loot(e, thread, 1200, text="You receive item: ")
+        self.loot(e, vial, 1200, text="You receive item: ")
+        self.unresolved(e, [mixed], -170, 1202)
+        explained = self.merchant_spend(e, 800, 700, 1300)
+        self.loot(e, thread, 1300, text="You receive item: ")
+        self.unresolved(e, [explained], -100, 1302, status="balanced")
+        self.assertEqual(self.analyse(e, "Fine Thread")["spent"]["purchases"], 0)
+
     def test_purchases_count_their_cost_and_an_outbid_refund_cancels_one(self):
         e = Events()
         e.activity("auction_purchase", -500, 1100, item={"id": 1, "name": "Ore"}, quantity=5)
