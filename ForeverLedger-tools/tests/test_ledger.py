@@ -84,7 +84,7 @@ function GetInboxItem(i,s)
 end
 TakeInboxMoney=noop; AutoLootMailItem=noop; TakeInboxItem=noop; SendMail=noop
 function GetSendMailMoney() return 10000 end
-function GetSendMailPrice() return 30 end
+function GetSendMailPrice() return 10030 end
 function GetSendMailCOD() return 0 end
 function GetSendMailItemLink() return nil end
 function GetTargetTradeMoney() return 2000 end
@@ -112,7 +112,7 @@ class AddonTests(unittest.TestCase):
         self.lua=LuaRuntime(unpack_returned_tuples=True)
         self.lua.execute(MOCKS)
         self.lua.execute("F={}")
-        for name in ("Core.lua","Collectors.lua","Disenchant.lua","Valuation.lua","Prices.lua","Chart.lua","UI.lua"):
+        for name in ("Core.lua","Collectors.lua","Disenchant.lua","Valuation.lua","Profit.lua","Prices.lua","Sync.lua","Highlights.lua","Chart.lua","UI.lua","Minimap.lua"):
             code=(ROOT/"ForeverLedger"/name).read_text(encoding="utf-8")
             self.lua.execute("assert(loadstring(...))('ForeverLedger',F)",code)
         self.lua.execute('F.Init({}, {guid="Player-Main",name="Main-Realm",realm="Realm",build="test"}); F.ObserveBalance(WALLET)')
@@ -281,37 +281,352 @@ class AddonTests(unittest.TestCase):
     def test_nil_positions_in_api_return(self):
         self.assertEqual(self.run_lua('local a,b,c,d=F.Call(function() return nil,"x",nil,42 end); return d'),42)
 
-    def test_mail_sale_and_duplicate_success(self):
+    def test_mail_sale_counts_once_however_often_the_client_confirms(self):
         self.post()
-        self.run_lua('''
+        self.run_lua("""
         INBOX={{invoiceType="seller",money=100000,gross=100000,refund=5000,fee=5000,quantity=1}}
-        F.context.mail=true; F.ScanMail(); F.TakeMail(1,"money"); F.MailSuccess(nil); F.MailSuccess(nil)
-        ''')
+        F.context.mail=true; F.ScanMail()
+        INBOX[1].money=0; F.ScanMail(); F.events.MAIL_SUCCESS(); F.events.MAIL_SUCCESS()
+        INBOX={}; F.ScanMail(); F.ScanMail()
+        """)
         self.assertEqual(len(self.kind("auction_sale")),1)
         self.assertEqual(self.kind("auction_sale")[0]["commission"],5000)
+        self.assertEqual(self.kind("mail_collected")[0]["mode"],"money")
 
-    def test_stale_mail_cache_not_used_after_index_shift(self):
-        self.run_lua('''
+    def test_sales_collected_right_after_an_item_mail_are_not_lost(self):
+        # An expired item followed by sold mail left 2250g under Not identified on TBC,
+        # where an item take is never confirmed.
+        self.run_lua("""
+        local sale={invoiceType="seller",money=300,gross=300,refund=0,fee=15,quantity=1}
+        INBOX={{subject="Auction expired: Copper Ore",items={{link="item:2770",quantity=2}}},
+            sale,{invoiceType="seller",money=700,gross=700,refund=0,fee=35,quantity=1,subject="Auction successful: Tin Ore"}}
+        F.context.mail=true; F.ScanMail()
+        table.remove(INBOX,1); F.ScanMail()
+        table.remove(INBOX,1); F.ObserveBalance(100300); F.ScanMail()
+        table.remove(INBOX,1); F.ObserveBalance(101000); F.ScanMail()
+        F.Flush()
+        """)
+        self.assertEqual([d["money"] for d in self.kind("auction_sale")],[300,700])
+        self.assertEqual(len(self.kind("auction_return")),1)
+        reconciliation=self.kind("reconciliation")[0]
+        self.assertEqual((reconciliation["residual"],reconciliation["status"]),(0,"balanced"))
+
+    def test_retried_take_of_a_paid_mail_counts_only_what_was_paid(self):
+        # A mail addon took one of two identical sales again after it had paid.
+        self.run_lua("""
+        local function sale() return {invoiceType="seller",money=500,gross=500,refund=0,fee=25,quantity=5} end
+        INBOX={sale(),sale()}
+        F.context.mail=true; F.ScanMail()
+        INBOX[1].money=0; F.ScanMail(); F.events.MAIL_SUCCESS(); F.ScanMail()
+        F.ObserveBalance(100500); F.Flush()
+        """)
+        self.assertEqual(len(self.kind("auction_sale")),1)
+        self.assertEqual(self.kind("reconciliation")[0]["residual"],0)
+        self.run_lua('table.remove(INBOX,1); INBOX[1].money=0; F.ScanMail(); F.ObserveBalance(101000); F.Flush()')
+        self.assertEqual(len(self.kind("auction_sale")),2)
+        self.assertEqual(self.kind("reconciliation")[1]["residual"],0)
+
+    def test_identical_sales_with_different_amounts_keep_their_own(self):
+        self.run_lua("""
+        INBOX={{invoiceType="seller",money=3341,gross=3500,quantity=1},{invoiceType="seller",money=3332,gross=3490,quantity=1},
+            {invoiceType="seller",money=3341,gross=3500,quantity=1}}
+        F.context.mail=true; F.ScanMail()
+        table.remove(INBOX,2); F.ScanMail()
+        """)
+        self.assertEqual([d["money"] for d in self.kind("auction_sale")],[3332])
+
+    def test_collected_mail_is_named_after_an_index_shift(self):
+        self.run_lua("""
         INBOX={{sender="Alt-Realm",subject="Gold",money=100},{sender="Bank-Realm",subject="Rent",money=900}}
-        F.context.mail=true; F.ScanMail(); table.remove(INBOX,1)
-        F.TakeMail(1,"money"); F.MailSuccess(nil)
-        ''')
-        activity=self.kind("activity")[0]
-        self.assertEqual((activity["amount"],activity["sender"]),(900,"Bank-Realm"))
+        F.context.mail=true; F.ScanMail(); table.remove(INBOX,1); F.ScanMail()
+        table.remove(INBOX,1); F.ScanMail()
+        """)
+        activity=self.kind("activity")
+        self.assertEqual([(a["amount"],a["sender"]) for a in activity],[(100,"Alt-Realm"),(900,"Bank-Realm")])
 
     def test_mail_failed_no_claim(self):
-        self.run_lua('INBOX={{money=500}}; F.TakeMail(1,"money"); F.events.MAIL_FAILED(); F.MailSuccess(nil)')
+        self.run_lua('INBOX={{money=500}}; F.context.mail=true; F.ScanMail(); F.events.MAIL_FAILED(); F.ScanMail()')
+        self.assertEqual(self.kind("activity"),[])
+        self.assertEqual(self.kind("mail_collected"),[])
+
+    def test_mail_still_loading_is_not_taken_for_collected(self):
+        self.run_lua("""
+        RETRIEVING_DATA="Retrieving data"
+        INBOX={{sender="Alt-Realm",subject="Gold",money=100},{sender="Bank-Realm",subject="Rent",money=900}}
+        F.context.mail=true; F.ScanMail()
+        INBOX[2].subject=RETRIEVING_DATA; F.ScanMail()
+        INBOX[2].subject="Rent"; F.ScanMail()
+        """)
         self.assertEqual(self.kind("activity"),[])
 
-    def test_open_all_item_confirmation_not_money(self):
-        self.run_lua('INBOX={{money=500}}; F.TakeMail(1,"all"); F.MailSuccess(2770)')
+    def test_returned_and_deleted_mail_is_not_income(self):
+        self.run_lua("""
+        ReturnInboxItem=function() end; DeleteInboxItem=function() end
+        F.InstallHooks()
+        INBOX={{sender="Alt-Realm",subject="Gold",money=100},{sender="Bank-Realm",subject="Junk",items={{link="item:2770",quantity=1}}}}
+        F.context.mail=true; F.ScanMail()
+        ReturnInboxItem(1); table.remove(INBOX,1); F.ScanMail()
+        DeleteInboxItem(1); table.remove(INBOX,1); F.ScanMail()
+        """)
+        self.assertEqual(self.kind("mail_collected"),[])
+
+    def test_mailbox_reopened_empty_collects_nothing(self):
+        self.run_lua("""
+        INBOX={{money=500}}; F.events.MAIL_SHOW()
+        F.events.MAIL_CLOSED(); INBOX={}; F.events.MAIL_SHOW()
+        """)
+        self.assertEqual(self.kind("mail_collected"),[])
+
+    def test_one_attachment_taken_then_cod_paid_once(self):
+        self.run_lua("""
+        INBOX={{sender="Alt-Realm",subject="Ore",cod=400,items={{link="item:2770",quantity=2},{link="item:2771",quantity=3}}}}
+        F.context.mail=true; F.ScanMail()
+        table.remove(INBOX[1].items,1); INBOX[1].cod=0; F.ScanMail()
+        INBOX={}; F.ScanMail()
+        """)
+        collected=self.kind("mail_collected")
+        self.assertEqual([(c["mode"],len(c["items"])) for c in collected],[("item",1),("item",1)])
+        self.assertEqual([a["amount"] for a in self.kind("activity") if a["category"]=="mail_cod"],[-400])
+
+    def old_mail_records(self):
+        # Records as earlier versions left them: mailbox reads and unexplained gold, no sale.
+        self.run_lua("""
+        function READ()
+            local rows={}
+            for i=1,#INBOX do rows[i]=F.ReadMail(i) end
+            F.Snapshot("mail",rows,true,{visible=#rows,total=#rows})
+        end
+        function SALE(money) return {invoiceType="seller",money=money,gross=money,refund=0,fee=5,quantity=1} end
+        F.db.mailBackfilled=nil
+        """)
+
+    def test_backfill_recovers_sales_an_item_mail_hid(self):
+        self.old_mail_records()
+        self.run_lua("""
+        INBOX={{subject="Auction expired: Copper Ore",items={{link="item:2770",quantity=2}}},SALE(300),SALE(700)}
+        READ(); table.remove(INBOX,1); READ()
+        NOW=NOW+1; table.remove(INBOX,1); READ(); table.remove(INBOX,1); READ()
+        STAMP=NOW
+        F.ObserveBalance(101000); F.Flush()
+        NOW=NOW+500
+        RESULT=F.BackfillMail()
+        """)
+        self.assertEqual(self.run_lua('return RESULT.amount'),1000)
+        sold=[d for d in self.kind("activity") if d["category"]=="auction_sale"]
+        self.assertEqual(sorted(d["amount"] for d in sold),[300,700])
+        for d in sold:
+            self.assertTrue(d["backfilled"])
+            self.assertEqual(d["occurredAt"],self.run_lua('return STAMP'))
+            self.assertEqual(d["confidence"],"backfilled_snapshot")
+        self.assertEqual(len(self.kind("auction_sale")),2)
+        summary=self.kind("mail_backfill")[0]
+        self.assertEqual((summary["status"],summary["added"],summary["amount"],summary["residual"]),("applied",2,1000,1000))
+        self.assertEqual(summary["reconciliationIDs"],[self.events_of("reconciliation")[0]["id"]])
+
+    def test_backfill_belongs_to_the_character_that_collected(self):
+        self.old_mail_records()
+        self.run_lua("""
+        INBOX={SALE(300)}; READ(); INBOX={}; READ(); F.ObserveBalance(100300); F.Flush()
+        F.identity={guid="Player-Other",name="Other-Realm",realm="Realm"}; F.session="later"
+        F.BackfillMail()
+        """)
+        for e in self.events_of("activity"):
+            self.assertEqual((e["character"],e["characterName"]),("Player-Main","Main-Realm"))
+
+    def test_backfill_leaves_the_current_batch_alone(self):
+        self.old_mail_records()
+        self.run_lua("""
+        INBOX={SALE(300)}; READ(); INBOX={}; READ(); F.ObserveBalance(100300); F.Flush()
+        F.BackfillMail()
+        F.ObserveBalance(100350); F.Flush()
+        """)
+        self.assertEqual(self.kind("reconciliation")[-1]["residual"],50)
+
+    def test_backfill_voids_a_retried_take_recorded_twice(self):
+        self.old_mail_records()
+        self.run_lua("""
+        INBOX={SALE(500),SALE(500)}; READ()
+        local paid=F.Copy(F.ReadMail(1)); paid.mode="money"
+        INBOX={SALE(500)}; READ()
+        F.Invoice(F.Copy(paid)); F.Invoice(F.Copy(paid))
+        F.ObserveBalance(100500); F.Flush()
+        F.BackfillMail()
+        """)
+        sold=self.events_of("activity")
+        self.assertEqual(sum(e["data"]["amount"] for e in sold),500)
+        void=[e["data"] for e in sold if e["data"].get("correctsActivityID")]
+        self.assertEqual(len(void),1)
+        self.assertEqual(void[0]["amount"],-500)
+        self.assertEqual(self.kind("mail_backfill")[0]["removed"],1)
+
+    def test_backfill_refuses_a_correction_the_gold_does_not_prove(self):
+        self.old_mail_records()
+        self.run_lua("""
+        INBOX={SALE(300)}; READ(); INBOX={}; READ(); F.ObserveBalance(100299); F.Flush()
+        RESULT=F.BackfillMail()
+        """)
         self.assertEqual(self.kind("activity"),[])
-        self.run_lua('F.MailSuccess(nil)')
-        self.assertEqual(self.kind("activity")[0]["amount"],500)
+        self.assertEqual(self.kind("auction_sale"),[])
+        self.assertEqual(self.run_lua('return RESULT.skipped'),1)
+        self.assertEqual(self.kind("mail_backfill")[0]["status"],"skipped")
+
+    def test_backfill_ignores_mail_that_was_recorded(self):
+        self.old_mail_records()
+        self.run_lua("""
+        INBOX={SALE(300)}; READ(); local paid=F.Copy(F.ReadMail(1)); paid.mode="money"; INBOX={}; READ()
+        F.Invoice(paid); F.ObserveBalance(100300); F.Flush()
+        F.BackfillMail()
+        """)
+        self.assertEqual(len(self.kind("activity")),1)
+        self.assertEqual(self.kind("mail_backfill"),[])
+
+    def test_backfill_ignores_unread_rows(self):
+        self.old_mail_records()
+        self.run_lua("""
+        RETRIEVING_DATA="Retrieving data"
+        INBOX={SALE(300),{subject="Rent",money=900}}; READ()
+        F.Snapshot("mail",{F.ReadMail(1)},false,{visible=2,total=2})
+        READ(); F.ObserveBalance(100900); F.Flush()
+        F.BackfillMail()
+        """)
+        self.assertEqual(self.kind("activity"),[])
+
+    def test_backfill_runs_once_from_login(self):
+        self.old_mail_records()
+        self.run_lua("""
+        INBOX={SALE(300)}; READ(); INBOX={}; READ(); F.ObserveBalance(100300); F.Flush()
+        F.baselined=nil; F.Init(F.db,F.identity)
+        F.baselined=nil; F.Init(F.db,F.identity)
+        """)
+        self.assertEqual(len(self.kind("auction_sale")),1)
+        self.assertTrue(self.run_lua('return F.db.mailBackfilled'))
+        self.assertTrue(self.run_lua('return #MESSAGES>0'))
+
+    def events_of(self,kind):
+        return [e for e in self.events() if e["kind"]==kind]
+
+    TRAINER_MOCKS='''function BuyTrainerService() end
+function GetTrainerServiceCost() return 500 end
+function GetTrainerServiceInfo() return "Linen Belt","","available" end
+function GetTrainerServiceSkillLine() return "Tailoring" end
+'''
+
+    def test_training_records_which_kind_of_trainer(self):
+        for answer,kind in [("1","profession"),("nil","class")]:
+            self.setUp()
+            self.run_lua(self.TRAINER_MOCKS+f'function IsTradeskillTrainer() return {answer} end\n'
+                'F.InstallHooks(); BuyTrainerService(3); F.ObserveBalance(WALLET-500); F.Flush()')
+            training=self.kind("activity")[0]
+            self.assertEqual((training["service"],training["skillLine"],training["trainer"]),("Linen Belt","Tailoring",kind))
+
+    def test_training_without_a_trainer_check_leaves_the_kind_unknown(self):
+        self.run_lua(self.TRAINER_MOCKS+'F.InstallHooks(); BuyTrainerService(3); F.ObserveBalance(WALLET-500); F.Flush()')
+        training=self.kind("activity")[0]
+        self.assertEqual((training["category"],training["amount"]),("training",-500))
+        self.assertNotIn("trainer",training)
 
     def test_mail_send_postage_separate(self):
         self.run_lua('F.InstallHooks(); SendMail("Bank-Realm"); F.events.MAIL_SEND_SUCCESS()')
         self.assertEqual([e["amount"] for e in self.kind("activity")],[-10000,-30])
+        self.assertEqual(self.kind("mail_sent")[0]["postage"],30)
+
+    def test_mail_send_balances_when_price_includes_the_money(self):
+        self.run_lua('F.InstallHooks(); SendMail("Bank-Realm"); F.events.MAIL_SEND_SUCCESS(); F.ObserveBalance(100000-10030); F.Flush()')
+        self.assertEqual(self.kind("reconciliation")[0]["status"],"balanced")
+
+    def test_mail_postage_read_from_either_kind_of_price(self):
+        for price,money,attachments,postage in [(10030,10000,0,30),(10120,10000,4,120),(30,10000,0,30),
+                (30,10,0,30),(120,10,4,120),(30,0,0,30),(360,0,12,360)]:
+            self.assertEqual(self.run_lua(f'return F.MailPostage({price},{money},{attachments})'),postage,(price,money,attachments))
+        self.assertIsNone(self.run_lua('return F.MailPostage(nil,10000,0)'))
+
+    def old_mail_send(self,money=10000,postage=10030,seen=None,items="{}"):
+        # A send as earlier versions recorded it, with the money counted again as postage.
+        seen=100000-postage if seen is None else seen
+        self.run_lua(f"""
+        F.db.postageRepaired=nil
+        F.Emit("mail_sent",{{recipient="Bank-Realm",money={money},postage={postage},cod=0,items={items}}})
+        F.Claim("mail_sent",-{money},{{recipient="Bank-Realm",items={items}}})
+        F.Claim("postage",-{postage},{{recipient="Bank-Realm"}})
+        F.ObserveBalance({seen}); F.Flush()
+        """)
+
+    def test_postage_repair_corrects_a_send_the_gold_proves(self):
+        self.old_mail_send()
+        self.run_lua('STAMP=NOW; NOW=NOW+500; RESULT=F.RepairPostage()')
+        self.assertEqual((self.run_lua('return RESULT.fixed'),self.run_lua('return RESULT.amount')),(1,10000))
+        rows=[d for d in self.kind("activity") if d["category"]=="postage"]
+        self.assertEqual(sum(d["amount"] for d in rows),-30)
+        self.assertEqual([d["amount"] for d in rows],[-10030,10030,-30])
+        self.assertEqual(rows[1]["correctsActivityID"],self.events_of("activity")[1]["id"])
+        for d in rows[1:]:
+            self.assertTrue(d["backfilled"])
+            self.assertEqual(d["occurredAt"],self.run_lua('return STAMP'))
+        summary=self.kind("mail_backfill")[0]
+        self.assertEqual((summary["repair"],summary["status"],summary["amount"],summary["residual"]),("postage","applied",10000,10000))
+        self.assertEqual(summary["reconciliationIDs"],[self.events_of("reconciliation")[0]["id"]])
+
+    def test_postage_repair_belongs_to_the_character_that_sent(self):
+        self.old_mail_send()
+        self.run_lua("""
+        F.identity={guid="Player-Other",name="Other-Realm",realm="Realm"}; F.session="later"
+        F.RepairPostage()
+        """)
+        for e in self.events_of("activity"):
+            self.assertEqual((e["character"],e["characterName"]),("Player-Main","Main-Realm"))
+
+    def test_postage_repair_refuses_what_the_gold_does_not_prove(self):
+        self.old_mail_send(seen=100000-10029)
+        self.run_lua('RESULT=F.RepairPostage()')
+        self.assertEqual(self.run_lua('return RESULT.skipped'),1)
+        self.assertEqual(len(self.kind("activity")),2)
+        self.assertEqual(self.kind("mail_backfill")[0]["status"],"skipped")
+
+    def test_postage_repair_skips_a_send_with_no_unexplained_gold_on_record(self):
+        self.run_lua("""
+        F.db.postageRepaired=nil
+        F.Emit("mail_sent",{recipient="Bank-Realm",money=10000,postage=10030,cod=0,items={}})
+        F.Claim("mail_sent",-10000,{recipient="Bank-Realm",items={}})
+        F.Claim("postage",-10030,{recipient="Bank-Realm"})
+        RESULT=F.RepairPostage()
+        """)
+        self.assertEqual(self.run_lua('return RESULT.skipped'),1)
+        self.assertEqual(len([d for d in self.kind("activity") if d["category"]=="postage"]),1)
+
+    def test_postage_repair_leaves_correct_sends_alone(self):
+        self.old_mail_send(money=0,postage=120,items='{{quantity=1},{quantity=1},{quantity=1},{quantity=1}}')
+        self.old_mail_send(money=10000,postage=30,seen=100000-120-10030)
+        self.run_lua('F.RepairPostage()')
+        self.assertEqual(self.kind("mail_backfill"),[])
+        self.assertEqual(len(self.kind("activity")),4)
+
+    def test_postage_repair_leaves_a_charge_that_is_not_the_sends_price(self):
+        self.run_lua("""
+        F.db.postageRepaired=nil
+        F.Emit("mail_sent",{recipient="Bank-Realm",money=10000,postage=10030,cod=0,items={}})
+        F.Claim("mail_sent",-10000,{recipient="Bank-Realm",items={}})
+        F.Claim("postage",-5000,{recipient="Bank-Realm"})
+        F.ObserveBalance(95000); F.Flush()
+        F.RepairPostage()
+        """)
+        self.assertEqual(self.kind("reconciliation")[0]["residual"],10000)
+        self.assertEqual(self.kind("mail_backfill"),[])
+
+    def test_postage_repair_keeps_attachment_postage(self):
+        items='{{quantity=1},{quantity=1},{quantity=1},{quantity=1}}'
+        self.old_mail_send(money=10000,postage=10120,items=items)
+        self.run_lua('F.RepairPostage()')
+        self.assertEqual(sum(d["amount"] for d in self.kind("activity") if d["category"]=="postage"),-120)
+
+    def test_postage_repair_runs_once_from_login(self):
+        self.old_mail_send()
+        self.run_lua("""
+        F.baselined=nil; F.Init(F.db,F.identity)
+        F.baselined=nil; F.Init(F.db,F.identity)
+        """)
+        self.assertEqual(len(self.kind("mail_backfill")),1)
+        self.assertTrue(self.run_lua('return F.db.postageRepaired'))
+        self.assertTrue(self.run_lua('return #MESSAGES>0'))
 
     def test_trade_requires_completed_event(self):
         self.run_lua('F.events.TRADE_SHOW(); F.events.TRADE_CLOSED()')
@@ -354,6 +669,15 @@ class AddonTests(unittest.TestCase):
         self.assertEqual(self.kind("diagnostic"),[])
         self.assertEqual(len(self.kind("logout")),1)
 
+    def test_logout_zero_money_keeps_balance(self):
+        self.lua.execute("assert(loadstring(...))('ForeverLedger',F)",(ROOT/"ForeverLedger"/"Main.lua").read_text())
+        self.run_lua('''
+        LAST_FRAME.scripts.OnEvent(nil,"ADDON_LOADED","ForeverLedger"); LAST_FRAME.scripts.OnEvent(nil,"PLAYER_LOGIN")
+        KEPT=WALLET; WALLET=0; LAST_FRAME.scripts.OnEvent(nil,"PLAYER_LOGOUT")
+        ''')
+        self.assertEqual(self.kind("balance"),[])
+        self.assertEqual(self.run_lua('return F.character.balance'),self.run_lua('return KEPT'))
+
     def test_real_lua_export_to_sqlite(self):
         self.run_lua('''
         for i=1,6 do
@@ -393,6 +717,17 @@ class ImportTests(unittest.TestCase):
         path.write_text(json.dumps(dict(schema=1,sourceID=source,events=events,owners={})),encoding="utf-8")
         return path
 
+    def test_corrected_logout_balance_is_excluded(self):
+        p=self.save("one",[
+            event("one",1,"baseline",dict(balance=500)),
+            event("one",2,"balance",dict(before=500,after=0,delta=-500)),
+            event("one",3,"reconciliation",dict(balanceIDs=["one:2"],activityIDs=[],observed=-500,explained=0,residual=-500,status="unresolved")),
+            event("one",4,"balance_correction",dict(balanceID="one:2",owner="Main-Realm",amount=500))])
+        ledger.import_file(self.db,p)
+        report=ledger.report(self.db)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM cash_movements").fetchone()[0],0)
+        self.assertEqual(json.dumps(report).count("-500"),0)
+
     def test_repeated_import_is_idempotent(self):
         p=self.save("one",[event("one",1,"balance",dict(before=0,after=50,delta=50))])
         self.assertEqual(ledger.import_file(self.db,p),1)
@@ -407,6 +742,24 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(r["internal_transfer_net"],0)
         self.assertEqual(r["classified_external_cash_in"],0)
         self.assertEqual(r["classified_external_cash_out"],30)
+
+    def test_forever_surnames_and_hidden_realms_still_count_as_internal(self):
+        # Each account sits on its own hidden realm, and mail names carry a surname plus
+        # the sender's own realm: Modars on Realm2 mails "Setha Bank", who is on Realm6.
+        a=[event("one",1,"activity",dict(category="mail_sent",amount=-100,recipient="Setha Bank-Realm2"),"Modars-Realm2"),
+           event("one",2,"activity",dict(category="trade",amount=50,counterparty="Setha Bank-Realm2"),"Modars-Realm2")]
+        b=[event("two",1,"activity",dict(category="mail_received",amount=100,sender="Modars Setharius-Realm6"),"Setha-Realm6"),
+           event("two",2,"activity",dict(category="trade",amount=-50,counterparty="Modars Setharius-Realm6"),"Setha-Realm6"),
+           event("two",3,"activity",dict(category="mail_received",amount=70,sender="Stranger Smith-Realm6"),"Setha-Realm6")]
+        ledger.import_file(self.db,self.save("one",a)); ledger.import_file(self.db,self.save("two",b))
+        r=ledger.report(self.db)
+        self.assertEqual(r["internal_transfer_net"],0)
+        self.assertEqual(r["classified_external_cash_in"],70)
+
+    def test_character_key_ignores_realm_surname_and_case(self):
+        for name in ("Setha","setha-Realm","Setha Bank","Setha Bank-CAMWOWEU5Realm6PvP"," Setha "):
+            self.assertEqual(ledger.character_key(name),"setha",name)
+        self.assertEqual(ledger.character_key("Grüße-Realm"),ledger.character_key("GRÜSSE"))
 
     def test_external_trade_preserves_both_gross_flows(self):
         e=event("one",1,"activity",dict(category="trade",amount=0,moneyIn=100,moneyOut=100,counterparty="Other-Realm"))
@@ -443,6 +796,41 @@ class ImportTests(unittest.TestCase):
         row=ledger.report(self.db,{"1":1000})["items"][0]
         self.assertEqual(row["margin_before_acquisition"],9500)
         self.assertEqual(row["profit_at_supplied_unit_cost"],8500)
+
+    def test_backfill_corrections_change_cash_sales_and_unresolved(self):
+        events=[event("one",1,"balance",dict(delta=500,after=500)),
+            event("one",2,"auction_sale",dict(item=dict(id=1),gross=500,commission=25,quantity=1)),
+            event("one",3,"activity",dict(category="auction_sale",amount=500,saleID="one:2")),
+            event("one",4,"auction_sale",dict(item=dict(id=1),gross=500,commission=25,quantity=1)),
+            event("one",5,"activity",dict(category="auction_sale",amount=500,saleID="one:4")),
+            event("one",6,"reconciliation",dict(balanceIDs=["one:1"],observed=500,explained=1000,residual=-500,status="unresolved")),
+            event("one",7,"reconciliation",dict(balanceIDs=[],observed=9,explained=0,residual=9,status="unresolved")),
+            event("one",8,"activity",dict(category="auction_sale",amount=-500,correctsActivityID="one:5",correctsSaleID="one:4",backfilled=True)),
+            event("one",9,"mail_backfill",dict(status="applied",amount=-500,residual=-500,reconciliationIDs=["one:6"]))]
+        ledger.import_file(self.db,self.save("one",events))
+        r=ledger.report(self.db)
+        self.assertEqual((r["classified_external_cash_in"],r["classified_external_cash_out"]),(500,0))
+        self.assertEqual([u["event"] for u in r["unresolved_reconciliation"]],["one:7"])
+        self.assertEqual((r["items"][0]["gross"],r["items"][0]["sold_quantity"]),(500,1))
+
+    def test_postage_repair_changes_cash_and_unresolved(self):
+        events=[event("one",1,"balance",dict(delta=-10030,after=0)),
+            event("one",2,"activity",dict(category="mail_sent",amount=-10000,recipient="Other-Realm")),
+            event("one",3,"activity",dict(category="postage",amount=-10030,recipient="Other-Realm")),
+            event("one",4,"reconciliation",dict(balanceIDs=["one:1"],observed=-10030,explained=-20030,residual=10000,status="unresolved")),
+            event("one",5,"activity",dict(category="postage",amount=10030,correctsActivityID="one:3",backfilled=True)),
+            event("one",6,"activity",dict(category="postage",amount=-30,recipient="Other-Realm",backfilled=True)),
+            event("one",7,"mail_backfill",dict(repair="postage",status="applied",amount=10000,residual=10000,reconciliationIDs=["one:4"]))]
+        ledger.import_file(self.db,self.save("one",events))
+        r=ledger.report(self.db)
+        self.assertEqual(r["classified_external_cash_out"],10030)
+        self.assertEqual(r["unresolved_reconciliation"],[])
+
+    def test_skipped_backfill_leaves_gold_unresolved(self):
+        events=[event("one",1,"reconciliation",dict(balanceIDs=[],observed=9,explained=0,residual=9,status="unresolved")),
+            event("one",2,"mail_backfill",dict(status="skipped",amount=8,residual=9,reconciliationIDs=["one:1"]))]
+        ledger.import_file(self.db,self.save("one",events))
+        self.assertEqual(len(ledger.report(self.db)["unresolved_reconciliation"]),1)
 
     def test_snapshot_history_not_summed(self):
         events=[event("one",1,"snapshot",dict(location="bags",complete=True,rows=[dict(quantity=10,item=dict(id=1,vendorPrice=50))])),

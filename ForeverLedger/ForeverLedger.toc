@@ -9,7 +9,11 @@ Core.lua
 Collectors.lua
 Disenchant.lua
 Valuation.lua
+Profit.lua
 Prices.lua
+Sync.lua
+Highlights.lua
 Chart.lua
 UI.lua
+Minimap.lua
 Main.lua

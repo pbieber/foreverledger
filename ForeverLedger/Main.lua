@@ -40,12 +40,15 @@ frame:SetScript("OnEvent",function(_,event,...)
             F.RecordValue(true)
             SLASH_FOREVERLEDGER1="/fl"; SLASH_FOREVERLEDGER2="/foreverledger"
             SlashCmdList.FOREVERLEDGER=function(msg) safe(F.Command,msg) end
+            F.InstallMinimap()
+            F.InstallSync()
             F.Print("Recording. /fl opens the ledger. /fl account Main labels this account.")
             F.PromptMarker()
         end)
     elseif F.db then
         if event=="PLAYER_LOGOUT" then
-            safe(function() F.ObserveBalance(GetMoney(),F.context); F.Flush(); F.RecordValue(); F.Emit("logout",{}) end)
+            -- GetMoney can read 0 during logout. PLAYER_MONEY already kept the balance current.
+            safe(function() F.Flush(); F.RecordValue(); F.Emit("logout",{}) end)
         elseif F.events[event] then safe(F.events[event],...) end
     end
 end)
@@ -59,12 +62,10 @@ frame:SetScript("OnUpdate",function(_,dt)
         if F.bankDirty then F.bankDirty=nil; F.ScanBank() end
         if F.equipmentDirty then F.equipmentDirty=nil; F.ScanEquipment() end
         if F.mailDirty then F.mailDirty=nil; F.ScanMail() end
-        if F.pendingMail and F.Clock()-F.pendingMail.started>30 then
-            F.Emit("diagnostic",{message="Mail action timed out",mail=F.pendingMail}); F.pendingMail=nil
-        end
         if F.lastActivity and F.Clock()-F.lastActivity>2 then F.Flush(); F.lastActivity=nil end
         F.PriceTick()
         F.RecordValue()
+        F.SyncTick()
         if F.RefreshScanStatus and F.window and F.window:IsShown() then F.RefreshScanStatus() end
     end)
 end)

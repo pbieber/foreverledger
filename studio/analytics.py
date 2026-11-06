@@ -1,0 +1,780 @@
+"""Chart figures from one ledger database. All money is integer copper.
+
+Facts come from immutable events, following SCHEMA.md: a corrected balance is left
+out, a cancelled activity and its correction are both left out, and `occurredAt`
+wins over `time` for anything per period.
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import re
+from collections import Counter, deque
+
+import ledger
+
+LABELS = {
+    "repair": "Repair costs", "loot": "Loot", "quest": "Quest rewards",
+    "auction_sale": "Auction house sales", "auction_purchase": "Auction house purchases",
+    "auction_purchase_or_bid": "Auction house purchases", "auction_deposit": "Auction house fees",
+    "auction_cancel_fee": "Auction house fees", "vendor_sale": "Vendor sales",
+    "vendor_purchase": "Vendor purchases", "vendor_buyback": "Vendor purchases", "flight": "Flights",
+    "training": "Training", "mail_received": "Mail received", "mail_sent": "Mail sent",
+    "mail_cod": "Cash on delivery", "postage": "Postage", "trade": "Trades",
+}
+AH_SOLD = {"auction_sale"}
+AH_SPENT = {"auction_purchase", "auction_purchase_or_bid", "auction_deposit", "auction_cancel_fee"}
+TRANSFER_CATEGORIES = {"trade", "mail_received", "mail_sent", "mail_cod"}
+STORAGE_CATEGORIES = {"bank_deposit", "bank_withdrawal"}
+UNKNOWN_ITEM = "Unknown item"
+MAX_POINTS = 240
+COST_ROWS = (("class_training", "Class training"), ("profession_training", "Profession training"),
+             ("repair", "Repairs"), ("flight", "Flights"), ("ah_fees", "Auction house costs"),
+             ("ah_purchases", "Auction house purchases"))
+AH_BOUGHT = {"auction_purchase", "auction_purchase_or_bid"}
+# Ranks and recipe families that no class spell is named like.
+PROFESSION_PREFIXES = ("Apprentice ", "Journeyman ", "Expert ", "Artisan ", "Master ", "Grand Master ", "Enchant ",
+                       "Elixir of ", "Flask of ", "Transmute", "Smelt ")
+# Lessons bought this close together, by one character, came from one trainer.
+TRAINER_VISIT_SECONDS = 10
+ITEM_LINK = re.compile(r"\|Hitem:(\d+)[^|]*\|h\[([^\]]*)\]\|h\|r(?:x(\d+))?")
+# What the English client says when the recording character itself gains an item.
+FARMED_PREFIX, CRAFTED_PREFIX = "You receive loot: ", "You create: "
+ITEM_SOLD = {"auction_sale": "auction", "vendor_sale": "vendor"}
+ITEM_BOUGHT = {"auction_purchase": "auction", "auction_purchase_or_bid": "auction", "vendor_purchase": "vendor"}
+OUTBID_PREFIX = "Outbid on "
+# A bag snapshot this long after a craft may hold other changes, so it can't show the recipe.
+CRAFT_SNAPSHOT_SECONDS = 30
+MAX_ITEM_CHOICES = 300
+
+
+class UnknownWindow(Exception):
+    pass
+
+
+def _midnight_before(timestamp):
+    local = datetime.datetime.fromtimestamp(timestamp)
+    return timestamp - (local.hour * 3600 + local.minute * 60 + local.second)
+
+
+def _day_bounds(timestamp):
+    """The local day holding a moment. Stepping past 24 hours copes with clock changes."""
+    start = _midnight_before(timestamp)
+    return start, _midnight_before(start + 26 * 3600) - 1
+
+
+def marker_intervals(db):
+    """Each marker's stretches of time, per account, in order.
+
+    A marker runs until its end, the account's next marker, or the account's last
+    record. Both accounts can use one label, so a name can hold several intervals.
+    """
+    latest = dict(db.execute("SELECT source_id,MAX(time) FROM events GROUP BY source_id").fetchall())
+    intervals, open_marker = {}, {}
+
+    def close(source, at):
+        name, started = open_marker.pop(source)
+        intervals.setdefault(name, []).append((started, at))
+
+    for source, moment, kind, data in db.execute(
+            "SELECT source_id,time,kind,data FROM events WHERE kind IN ('episode_start','episode_end') "
+            "ORDER BY time,source_id,sequence"):
+        if source in open_marker:
+            close(source, moment)
+        if kind == "episode_start":
+            open_marker[source] = (json.loads(data).get("name") or "Unnamed marker", moment)
+    for source in list(open_marker):
+        close(source, latest[source])
+    return intervals
+
+
+def windows(db):
+    """Time spans an episode can use: markers first, then calendar days, then everything."""
+    span = db.execute("SELECT MIN(time),MAX(time) FROM events").fetchone()
+    if span[0] is None:
+        return []
+    result = []
+    markers = sorted(marker_intervals(db).items(), key=lambda item: min(i[0] for i in item[1]))
+    for name, intervals in markers:
+        result.append({"id": f"marker:{name}", "kind": "marker", "label": name,
+                       "start": min(i[0] for i in intervals), "end": max(i[1] for i in intervals)})
+    days = {}
+    for (moment,) in db.execute("SELECT DISTINCT time FROM events ORDER BY time DESC"):
+        days.setdefault(datetime.datetime.fromtimestamp(moment).date(), moment)
+    for day, moment in days.items():
+        start, end = _day_bounds(moment)
+        result.append({"id": f"day:{day.isoformat()}", "kind": "day", "label": day.strftime("%a %d %b %Y"),
+                       "start": start, "end": min(end, span[1])})
+    result.append({"id": "all", "kind": "all", "label": "All recorded history", "start": span[0], "end": span[1]})
+    return result
+
+
+def resolve_window(db, window_id):
+    for window in windows(db):
+        if window["id"] == window_id:
+            return window
+    raise UnknownWindow(window_id)
+
+
+def _balances(db):
+    """Per character, time-ordered (time, balance), with the opening balance kept separately."""
+    corrected = {json.loads(row[0]).get("balanceID") for row in db.execute(
+        "SELECT data FROM events WHERE kind='balance_correction'")}
+    series, opening = {}, {}
+    for event_id, source, character, moment, kind, data in db.execute(
+            "SELECT id,source_id,character,time,kind,data FROM events WHERE kind IN ('baseline','balance') "
+            "ORDER BY time,source_id,sequence"):
+        if event_id in corrected:
+            continue
+        d, key = json.loads(data), (source, character)
+        balance = d.get("balance") if kind == "baseline" else d.get("after")
+        if balance is None:
+            continue
+        if key not in series:
+            first = d.get("before") if kind == "balance" else None
+            opening[key] = balance if first is None else first
+        series.setdefault(key, []).append((moment, balance))
+    return series, opening
+
+
+def gold_between(db, start, end):
+    """Gold at the start and end of a span.
+
+    A character first seen inside the span counts from the balance it arrived with,
+    so an old character logging in for the first time is not mistaken for income.
+    """
+    series, opening = _balances(db)
+    total_start, total_end, characters = 0, 0, 0
+    for key, points in series.items():
+        if points[0][0] > end:
+            continue
+        before = [balance for moment, balance in points if moment <= start]
+        through = [balance for moment, balance in points if moment <= end]
+        total_start += before[-1] if before else opening[key]
+        total_end += through[-1]
+        characters += 1
+    return total_start, total_end, characters
+
+
+def _owners(db):
+    return ledger.owned_keys(db)
+
+
+def _activities(db):
+    """Activities that still stand, as (time, data, character), in time order."""
+    rows = [(event_id, moment, json.loads(data), character) for event_id, moment, data, character in db.execute(
+        "SELECT id,time,data,character FROM events WHERE kind='activity'")]
+    voided = {d[key] for _, _, d, _ in rows for key in ("correctsActivityID", "correctsSaleID") if d.get(key)}
+    standing = [(d.get("occurredAt") or moment, d, character) for event_id, moment, d, character in rows
+                if event_id not in voided and not d.get("correctsActivityID")]
+    standing.sort(key=lambda row: row[0])
+    return standing
+
+
+def _is_internal(data, owners):
+    if data.get("category") in STORAGE_CATEGORIES:
+        return True
+    peer = data.get("counterparty") or data.get("sender") or data.get("recipient")
+    return bool(data.get("category") in TRANSFER_CATEGORIES and peer and ledger.character_key(peer) in owners)
+
+
+def start_figure(db, window):
+    """Gold at the marker start, the change over the window, and what drove it."""
+    start, end = window["start"], window["end"]
+    start_gold, end_gold, characters = gold_between(db, start, end)
+    change = end_gold - start_gold
+    owners = _owners(db)
+    by_label, explained = {}, 0
+    for moment, d, _ in _activities(db):
+        amount = d.get("amount") or 0
+        if not start <= moment <= end or not amount:
+            continue
+        explained += amount
+        if not _is_internal(d, owners):
+            label = LABELS.get(d.get("category"), d.get("category") or "Other")
+            by_label[label] = by_label.get(label, 0) + amount
+    unexplained = change - explained
+    if unexplained:
+        by_label["Not identified"] = by_label.get("Not identified", 0) + unexplained
+    rows = [{"label": label, "value": value} for label, value in by_label.items() if value]
+    income = sorted((r for r in rows if r["value"] > 0), key=lambda r: (-r["value"], r["label"]))[:3]
+    losses = sorted((r for r in rows if r["value"] < 0), key=lambda r: (r["value"], r["label"]))[:2]
+    shown = sum(r["value"] for r in income + losses)
+    return {"start": start_gold, "end": end_gold, "change": change, "characters": characters,
+            "income": income, "losses": losses, "other": change - shown,
+            "all_rows": sorted(rows, key=lambda r: -r["value"])}
+
+
+def _thin(points, start, end):
+    """Keep the last point of each equal time step, plus the first and last."""
+    if len(points) <= MAX_POINTS:
+        return points
+    step = max(1, (end - start)) / MAX_POINTS
+    kept = {}
+    for point in points:
+        kept[int((point["time"] - start) / step)] = point
+    result = [kept[key] for key in sorted(kept)]
+    if result[0] is not points[0]:
+        result.insert(0, points[0])
+    if result[-1] is not points[-1]:
+        result.append(points[-1])
+    return result
+
+
+def _span(db, window, chart_range):
+    if chart_range == "to_date":
+        first = db.execute("SELECT MIN(time) FROM events").fetchone()[0]
+        return first, window["end"]
+    return window["start"], window["end"]
+
+
+def auction_figure(db, window, chart_range):
+    """Cumulative gold collected and spent at the auction house, and the best items.
+
+    Sold is gold collected, net of commission, and includes returned deposits. Spent
+    is purchases plus deposits and cancellation fees. Sales count when their mail is
+    collected. Net gain is cash only: stock still held is not counted.
+    """
+    start, end = _span(db, window, chart_range)
+    sold, spent, points, items = 0, 0, [{"time": start, "sold": 0, "spent": 0}], {}
+    for moment, d, _ in _activities(db):
+        category, amount = d.get("category"), d.get("amount") or 0
+        if not start <= moment <= end or not amount or category not in AH_SOLD | AH_SPENT:
+            continue
+        if category in AH_SOLD:
+            sold += amount
+        else:
+            spent -= amount
+        points.append({"time": moment, "sold": sold, "spent": spent})
+        name = (d.get("item") or {}).get("name") or UNKNOWN_ITEM
+        row = items.setdefault(name, {"name": name, "item_id": None, "net": 0, "sold": 0, "spent": 0, "quantity": 0})
+        row["item_id"] = row["item_id"] or (d.get("item") or {}).get("id") or None
+        row["net"] += amount
+        if category in AH_SOLD:
+            row["sold"] += amount
+            row["quantity"] += d.get("quantity") or 0
+        else:
+            row["spent"] -= amount
+    points.append({"time": end, "sold": sold, "spent": spent})
+    named = [row for name, row in items.items() if name != UNKNOWN_ITEM]
+    top = sorted(named, key=lambda row: (-row["net"], row["name"]))[:5]
+    return {"start": start, "end": end, "sold": sold, "spent": spent, "net": sold - spent,
+            "points": _thin(points, start, end), "top": top, "items": len(named),
+            "has_activity": bool(items)}
+
+
+def value_figure(db, window, chart_range):
+    """Estimated total value over time, adding each account's latest valuation.
+
+    One valuation only ever describes its own account, so accounts add up safely at
+    any moment. Each stays at its last value until its next observation.
+    """
+    start, end = _span(db, window, chart_range)
+    latest, points = {}, []
+
+    def snapshot(moment):
+        return {"time": moment, "total": sum(v["total"] for v in latest.values()),
+                "gold": sum(v["gold"] for v in latest.values()),
+                "assets": sum(v["assets"] for v in latest.values()),
+                "equipped": sum(v["equipped"] for v in latest.values()),
+                "unpriced": sum(v["unpriced"] for v in latest.values())}
+
+    for moment, source, data in db.execute(
+            "SELECT time,source_id,data FROM events WHERE kind='valuation' AND time<=? ORDER BY time,source_id,sequence",
+            (end,)):
+        d = json.loads(data)
+        if moment >= start and not points and latest:
+            points.append(snapshot(start))
+        latest[(source, d.get("scope"))] = {
+            "total": d.get("total") or 0, "gold": d.get("gold") or 0, "assets": d.get("assets") or 0,
+            "equipped": d.get("equipped") or 0, "unpriced": d.get("unpricedRows") or 0}
+        if moment >= start:
+            points.append(snapshot(moment))
+    if latest and not points:
+        points.append(snapshot(start))
+    if points and points[-1]["time"] < end:
+        points.append(dict(points[-1], time=end))
+    first, last = (points[0], points[-1]) if points else (None, None)
+    return {"start": start, "end": end, "points": _thin(points, start, end),
+            "first": first["total"] if first else None, "last": last["total"] if last else None,
+            "change": last["total"] - first["total"] if points else None,
+            "unpriced": last["unpriced"] if last else 0, "accounts": len(latest)}
+
+
+def _item_names(db):
+    """Every item name the ledger has seen, from item records anywhere in the events."""
+    names = set()
+
+    def walk(value):
+        if isinstance(value, dict):
+            if isinstance(value.get("name"), str) and ("id" in value or "link" in value):
+                names.add(value["name"])
+            for inner in value.values():
+                walk(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                walk(inner)
+
+    for (data,) in db.execute("SELECT data FROM events"):
+        walk(json.loads(data))
+    return names
+
+
+def _training_kinds(trainings, item_names):
+    """"class" or "profession" for each training activity, keyed by id() of its data.
+
+    Newer records say which kind of trainer it was. Older ones are judged by name:
+    a profession rank, an enchant, or a recipe named after an item the ledger has
+    seen. A trainer visit follows its clearest member, which catches recipes for
+    items never seen. Anything else counts as a class lesson. `item_names` is called
+    only if a name has to be looked up.
+    """
+    visits, last = [], {}
+    for moment, d, character in trainings:
+        previous = last.get(character)
+        if previous and moment - previous[0] <= TRAINER_VISIT_SECONDS:
+            visit = previous[1]
+            visit.append(d)
+        else:
+            visit = [d]
+            visits.append(visit)
+        last[character] = (moment, visit)
+
+    names = None
+
+    def looks_like_profession(d):
+        nonlocal names
+        if d.get("trainer") in ("class", "profession"):
+            return d["trainer"] == "profession"
+        service = d.get("service") or ""
+        if service.startswith(PROFESSION_PREFIXES):
+            return True
+        if names is None:
+            names = item_names()
+        return service in names
+
+    kinds = {}
+    for visit in visits:
+        profession = any(looks_like_profession(d) for d in visit)
+        for d in visit:
+            known = d.get("trainer")
+            kinds[id(d)] = known if known in ("class", "profession") else "profession" if profession else "class"
+    return kinds
+
+
+def _lost_listing_fees(db, activities):
+    """Each deposit kept by the auction house because a listing came back unsold.
+
+    Returns (time, copper) per loss, with copper None when the deposit is not on
+    record. A server-identified outcome carries its deposit. Otherwise, as on the
+    old auction house, a returned listing takes the earliest earlier deposit for the
+    same item and quantity that no sale has already claimed back.
+    """
+    timeline = []
+    for moment, d, _ in activities:
+        category = d.get("category")
+        if category == "auction_deposit" and not d.get("auctionKey"):
+            timeline.append((moment, 0, "deposit", d))
+        elif category == "auction_sale":
+            timeline.append((moment, 1, "sale", d))
+    for moment, kind, data in db.execute(
+            "SELECT time,kind,data FROM events WHERE kind IN ('auction_outcome','auction_return')"):
+        timeline.append((moment, 1, kind, json.loads(data)))
+    timeline.sort(key=lambda row: (row[0], row[1]))
+
+    unsold, losses = {}, []
+    for moment, _, kind, d in timeline:
+        key = ((d.get("item") or {}).get("name"), d.get("quantity"))
+        deposits = unsold.setdefault(key, deque())
+        if kind == "deposit":
+            deposits.append(-(d.get("amount") or 0))
+        elif kind == "sale":
+            if deposits:
+                refund = d.get("depositRefund")
+                if refund in deposits:
+                    deposits.remove(refund)
+                else:
+                    deposits.popleft()
+        elif kind == "auction_outcome":
+            if d.get("depositLost"):
+                losses.append((moment, d["depositLost"]))
+        elif not d.get("auctionKey"):
+            losses.append((moment, deposits.popleft() if deposits else None))
+    return losses
+
+
+def cost_figure(db, window):
+    """What was spent in a window on six kinds of cost, largest first.
+
+    Auction house costs are listing fees lost to unsold auctions plus the house's
+    cut of each sale, which never reached the wallet. A listing still up has cost
+    nothing yet. Purchases are net of bids the auction house sent back.
+    """
+    start, end = window["start"], window["end"]
+    activities = _activities(db)
+    inside = [row for row in activities if start <= row[0] <= end]
+    totals = {key: 0 for key, _ in COST_ROWS}
+    counts = {key: 0 for key, _ in COST_ROWS}
+    parts = {"listing_fees": 0, "ah_cut": 0, "bought": 0, "bid_refunds": 0}
+
+    trainings = [row for row in inside if row[1].get("category") == "training"]
+    kinds = _training_kinds(trainings, lambda: _item_names(db))
+    for _, d, _ in inside:
+        category, amount = d.get("category"), d.get("amount") or 0
+        if category == "training":
+            key = f"{kinds[id(d)]}_training"
+            totals[key] -= amount
+            counts[key] += 1
+        elif category in ("repair", "flight"):
+            totals[category] -= amount
+            counts[category] += 1
+        elif category in AH_BOUGHT:
+            parts["bought"] -= amount
+            counts["ah_purchases"] += 1
+        elif category == "auction_cancel_fee":
+            parts["listing_fees"] -= amount
+            counts["ah_fees"] += 1
+        elif category == "auction_sale" and d.get("commission"):
+            parts["ah_cut"] += d["commission"]
+        elif category == "mail_received" and amount > 0 and "Auction House" in (d.get("sender") or ""):
+            parts["bid_refunds"] += amount
+
+    unpriced = 0
+    for moment, copper in _lost_listing_fees(db, activities):
+        if start <= moment <= end:
+            if copper is None:
+                unpriced += 1
+            else:
+                parts["listing_fees"] += copper
+                counts["ah_fees"] += 1
+    totals["ah_fees"] = parts["listing_fees"] + parts["ah_cut"]
+    totals["ah_purchases"] = parts["bought"] - parts["bid_refunds"]
+
+    order = {key: i for i, (key, _) in enumerate(COST_ROWS)}
+    rows = [{"key": key, "label": label, "value": totals[key], "count": counts[key]} for key, label in COST_ROWS]
+    rows.sort(key=lambda row: (-row["value"], order[row["key"]]))
+    for row in rows:
+        if row["key"] == "ah_fees":
+            row["parts"] = [{"label": "Unsold listing fees", "value": parts["listing_fees"]},
+                            {"label": "Auction house cut", "value": parts["ah_cut"]}]
+    return {"start": start, "end": end, "total": sum(totals.values()), "rows": rows, "parts": parts,
+            "unpriced_returns": unpriced, "has_activity": any(totals.values())}
+
+
+def _item_id(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _names_by_id(db):
+    """Item names by ID, from item records and chat links anywhere outside snapshots.
+
+    TBC snapshots carry links with no name in them, so their items are named from here.
+    """
+    names = {}
+
+    def walk(value):
+        if isinstance(value, dict):
+            item_id, name = _item_id(value.get("id")), value.get("name")
+            if item_id and isinstance(name, str) and name:
+                names.setdefault(item_id, name)
+            for inner in value.values():
+                walk(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                walk(inner)
+        elif isinstance(value, str) and "|Hitem:" in value:
+            for match in ITEM_LINK.finditer(value):
+                if match.group(2):
+                    names.setdefault(int(match.group(1)), match.group(2))
+
+    for (data,) in db.execute("SELECT data FROM events WHERE kind NOT IN ('snapshot','valuation')"):
+        walk(json.loads(data))
+    return names
+
+
+class ItemLedger:
+    """Each item's sales, purchases, loot and crafts over all recorded history, by name.
+
+    Names group the records, as in the auction figure, because a sale read from mail
+    often has no item ID. Loot and crafts come from the recording character's own chat
+    lines, so another player's loot is never counted. A bid the auction house sent back
+    is not a purchase.
+    """
+
+    def __init__(self, db):
+        self.db = db
+        self.names = _names_by_id(db)
+        self.ids = {name: item_id for item_id, name in self.names.items()}
+        self.records, self._bag_cache, self._recipes, self._costs = {}, {}, {}, {}
+        refunds = []
+        for moment, d, _ in _activities(db):
+            category, item = d.get("category"), d.get("item") or {}
+            name = self._name(item)
+            if category in ITEM_SOLD and name:
+                if category == "auction_sale":
+                    commission = d.get("commission") or 0
+                    revenue = (d["gross"] - commission if d.get("gross") is not None
+                               else (d.get("amount") or 0) - (d.get("depositRefund") or 0))
+                    gross = revenue + commission
+                else:
+                    gross = revenue = d.get("amount") or 0
+                self._record(name, item)["sold"].append({"time": moment, "kind": ITEM_SOLD[category],
+                                                         "quantity": d.get("quantity") or 0, "gross": gross or 0,
+                                                         "revenue": revenue})
+            elif category in ITEM_BOUGHT and name:
+                self._record(name, item)["bought"].append({"time": moment, "kind": ITEM_BOUGHT[category],
+                                                           "quantity": d.get("quantity") or None,
+                                                           "cost": -(d.get("amount") or 0)})
+            elif (category == "mail_received" and (d.get("amount") or 0) > 0
+                  and "Auction House" in (d.get("sender") or "") and (d.get("subject") or "").startswith(OUTBID_PREFIX)):
+                refunds.append((moment, d["subject"][len(OUTBID_PREFIX):].strip(), d["amount"]))
+        for moment, name, amount in refunds:
+            bids = self.records.get(name, {}).get("bought", [])
+            bid = next((b for b in bids if b["kind"] == "auction" and b["cost"] == amount and b["time"] <= moment
+                        and not b.get("refunded")), None)
+            if bid:
+                bid["refunded"] = True
+        for record in self.records.values():
+            record["bought"] = [b for b in record["bought"] if not b.get("refunded")]
+
+        for source, character, sequence, moment, data in db.execute(
+                "SELECT source_id,character,sequence,time,data FROM events WHERE kind='loot_message' "
+                "ORDER BY time,source_id,sequence"):
+            text = json.loads(data).get("text") or ""
+            kind = "farmed" if text.startswith(FARMED_PREFIX) else "crafted" if text.startswith(CRAFTED_PREFIX) else None
+            match = ITEM_LINK.search(text) if kind else None
+            if not match:
+                continue
+            item_id = int(match.group(1))
+            name = match.group(2) or self.names.get(item_id)
+            if name:
+                self._record(name, {"id": item_id})[kind].append({
+                    "time": moment, "quantity": int(match.group(3) or 1),
+                    "source": source, "character": character, "sequence": sequence})
+
+    def _name(self, item):
+        name = item.get("name")
+        if isinstance(name, str) and name:
+            return name
+        return self.names.get(_item_id(item.get("id")))
+
+    def _record(self, name, item):
+        record = self.records.setdefault(name, {"item_id": None, "sold": [], "bought": [], "farmed": [], "crafted": []})
+        record["item_id"] = record["item_id"] or _item_id(item.get("id"))
+        return record
+
+    def _empty(self, name):
+        return {"item_id": self.ids.get(name), "sold": [], "bought": [], "farmed": [], "crafted": []}
+
+    def name_of(self, item_id):
+        return self.names.get(item_id) or f"Item {item_id}"
+
+    def _bags(self, craft, later):
+        """The character's bag snapshot just before or after a record: {id, time, counts}, or None."""
+        op, order = (">", "ASC") if later else ("<", "DESC")
+        row = self.db.execute(
+            f"SELECT id,time,data FROM events WHERE source_id=? AND sequence{op}? AND kind='snapshot' "
+            f"AND character=? AND json_extract(data,'$.location')='bags' ORDER BY sequence {order} LIMIT 1",
+            (craft["source"], craft["sequence"], craft["character"])).fetchone()
+        if not row:
+            return None
+        if row[0] not in self._bag_cache:
+            counts = Counter()
+            for slot in json.loads(row[2]).get("rows") or []:
+                item_id = _item_id((slot.get("item") or {}).get("id"))
+                if item_id:
+                    counts[item_id] += slot.get("quantity") or 0
+            self._bag_cache[row[0]] = {"id": row[0], "time": row[1], "counts": counts}
+        return self._bag_cache[row[0]]
+
+    def recipe(self, name):
+        """What one craft of an item makes and uses: {makes, reagents: {item ID: count}, seen}.
+
+        The bags just before and just after a run of crafts show what went in. A run counts
+        only when the item made is the only thing that arrived and every amount divides
+        evenly by the crafts. The recipe seen most often wins, then the latest. None when
+        no run was clean.
+        """
+        if name in self._recipes:
+            return self._recipes[name]
+        record = self.records.get(name) or self._empty(name)
+        product = record["item_id"] or self.ids.get(name)
+        runs = {}
+        for craft in record["crafted"]:
+            before, after = self._bags(craft, later=False), self._bags(craft, later=True)
+            if not before or not after or after["time"] - craft["time"] > CRAFT_SNAPSHOT_SECONDS:
+                continue
+            run = runs.setdefault((before["id"], after["id"]),
+                                  {"before": before["counts"], "after": after["counts"], "casts": 0, "made": 0, "time": 0})
+            run["casts"] += 1
+            run["made"] += craft["quantity"]
+            run["time"] = max(run["time"], craft["time"])
+        seen, latest = Counter(), {}
+        for run in runs.values():
+            change = {k: run["after"][k] - run["before"][k] for k in set(run["after"]) | set(run["before"])}
+            gained = {k for k, v in change.items() if v > 0}
+            used = {k: -v for k, v in change.items() if v < 0}
+            casts = run["casts"]
+            if gained != {product} or change[product] != run["made"]:
+                continue
+            if run["made"] % casts or any(v % casts for v in used.values()):
+                continue
+            found = (run["made"] // casts, tuple(sorted((k, v // casts) for k, v in used.items())))
+            seen[found] += 1
+            latest[found] = max(latest.get(found, 0), run["time"])
+        result = None
+        if seen:
+            best = max(seen, key=lambda r: (seen[r], latest[r]))
+            result = {"makes": best[0], "reagents": dict(best[1]), "seen": seen[best]}
+        self._recipes[name] = result
+        return result
+
+    def unit_cost(self, name, end, visiting=frozenset()):
+        """Average copper per unit gained up to `end`, or None when none was.
+
+        Bought units cost what was paid, farmed ones nothing, and crafted ones what their
+        materials cost. A purchase with no quantity on record can't be split into units,
+        so it is left out.
+        """
+        key = (name, end)
+        if key in self._costs and not visiting:
+            return self._costs[key]
+        record = self.records.get(name) or self._empty(name)
+        bought = [b for b in record["bought"] if b["time"] <= end and b["quantity"]]
+        units = sum(b["quantity"] for b in bought) + sum(f["quantity"] for f in record["farmed"] if f["time"] <= end)
+        spent = sum(b["cost"] for b in bought)
+        made = sum(c["quantity"] for c in record["crafted"] if c["time"] <= end)
+        if made and name not in visiting:
+            each = self._materials_each(name, end, visiting | {name})
+            if each is not None:
+                units += made
+                spent += each * made
+        result = spent / units if units else None
+        if not visiting:
+            self._costs[key] = result
+        return result
+
+    def _materials_each(self, name, end, visiting):
+        recipe = self.recipe(name)
+        if not recipe:
+            return None
+        total = sum((self.unit_cost(self.name_of(item_id), end, visiting) or 0) * count
+                    for item_id, count in recipe["reagents"].items())
+        return total / recipe["makes"]
+
+    def summary(self, name, start, end):
+        """How much of an item moved inside a span, for choosing one."""
+        record = self.records.get(name) or self._empty(name)
+        inside = {key: [r for r in record[key] if start <= r["time"] <= end]
+                  for key in ("sold", "bought", "farmed", "crafted")}
+        return {"name": name, "item_id": record["item_id"] or self.ids.get(name),
+                "sold": sum(r["quantity"] for r in inside["sold"]),
+                "revenue": sum(r["revenue"] for r in inside["sold"]),
+                "farmed": sum(r["quantity"] for r in inside["farmed"]),
+                "crafted": sum(r["quantity"] for r in inside["crafted"]),
+                "bought": sum(r["quantity"] or 0 for r in inside["bought"]),
+                "purchases": len(inside["bought"])}
+
+    def analyse(self, name, start, end):
+        """Sales, where the item came from, and what it cost, inside a span. Copper throughout.
+
+        Spent is purchases of the item itself plus the materials used by its crafts here,
+        each material at its average cost per unit up to the span's end. Prices are per
+        unit, from auction sales before the commission, or vendor sales when there were none.
+        """
+        record = self.records.get(name) or self._empty(name)
+        inside = {key: [r for r in record[key] if start <= r["time"] <= end]
+                  for key in ("sold", "bought", "farmed", "crafted")}
+        sold = inside["sold"]
+        auction = [s for s in sold if s["kind"] == "auction" and s["quantity"]]
+        priced = auction or [s for s in sold if s["quantity"]]
+        prices = [round(s["gross"] / s["quantity"]) for s in priced]
+        crafts = inside["crafted"]
+        recipe = self.recipe(name) if crafts else None
+        reagents = []
+        for item_id, per_craft in (recipe or {}).get("reagents", {}).items():
+            reagent = self.name_of(item_id)
+            used, each = per_craft * len(crafts), self.unit_cost(reagent, end)
+            history = self.records.get(reagent) or self._empty(reagent)
+            reagents.append({
+                "name": reagent, "item_id": item_id, "per_craft": per_craft, "used": used,
+                "unit_cost": None if each is None else round(each), "cost": 0 if each is None else round(each * used),
+                "bought": sum(b["quantity"] or 0 for b in history["bought"] if b["time"] <= end),
+                "farmed": sum(f["quantity"] for f in history["farmed"] if f["time"] <= end),
+                "crafted": sum(c["quantity"] for c in history["crafted"] if c["time"] <= end)})
+        reagents.sort(key=lambda r: (-r["cost"], r["name"]))
+        bought_cost = sum(b["cost"] for b in inside["bought"])
+        materials = sum(r["cost"] for r in reagents)
+        revenue = sum(s["revenue"] for s in sold)
+        return {
+            "name": name, "item_id": record["item_id"] or self.ids.get(name), "start": start, "end": end,
+            "sold": {"quantity": sum(s["quantity"] for s in sold), "sales": len(sold), "revenue": revenue,
+                     "auction": sum(s["quantity"] for s in sold if s["kind"] == "auction"),
+                     "vendor": sum(s["quantity"] for s in sold if s["kind"] == "vendor"),
+                     "highest": max(prices) if prices else None, "lowest": min(prices) if prices else None,
+                     "price_from": (priced[0]["kind"] if priced else None)},
+            "gained": {"farmed": sum(f["quantity"] for f in inside["farmed"]),
+                       "crafted": sum(c["quantity"] for c in crafts), "crafts": len(crafts),
+                       "bought": sum(b["quantity"] or 0 for b in inside["bought"]),
+                       "unknown_purchases": sum(1 for b in inside["bought"] if not b["quantity"])},
+            "spent": {"bought": bought_cost, "purchases": len(inside["bought"]), "materials": materials,
+                      "total": bought_cost + materials},
+            "recipe": None if not recipe else {"makes": recipe["makes"], "seen": recipe["seen"], "reagents": reagents},
+            "materials_unknown": bool(crafts) and (not recipe or any(r["unit_cost"] is None for r in reagents)),
+            "net": revenue - bought_cost - materials,
+            "has_activity": any(inside.values()),
+        }
+
+
+def item_figure(db, window, name=None):
+    """One item's analysis inside a window, and the items worth choosing from.
+
+    Items are offered by what they sold for, then by how many moved. With no name, the
+    first of them is analysed.
+    """
+    items = ItemLedger(db)
+    start, end = window["start"], window["end"]
+    choices = [items.summary(item, start, end) for item in items.records]
+    choices = [c for c in choices if c["sold"] or c["farmed"] or c["crafted"] or c["purchases"]]
+    choices.sort(key=lambda c: (-c["revenue"], -(c["sold"] + c["farmed"] + c["crafted"] + c["bought"]), c["name"]))
+    choices = choices[:MAX_ITEM_CHOICES]
+    name = name or (choices[0]["name"] if choices else None)
+    return {"window": window, "choices": choices, "item": items.analyse(name, start, end) if name else None}
+
+
+def highlights(db, window):
+    """Moments marked in game to find in the recording, oldest first, inside the window.
+
+    Each is numbered and timed like the addon shows it: within the marker running on
+    its own account, or within its local day when none was. A removed one is left out.
+    """
+    removed = {row[0] for row in db.execute(
+        "SELECT json_extract(data,'$.highlightID') FROM events WHERE kind='highlight_removed'")}
+    markers, counts, result = {}, {}, []
+    for event_id, source, character, moment, kind, data in db.execute(
+            "SELECT id,source_id,character_name,time,kind,data FROM events "
+            "WHERE kind IN ('episode_start','episode_end','highlight') ORDER BY source_id,sequence"):
+        d = json.loads(data)
+        if kind == "episode_start":
+            markers[source] = (d.get("name") or "Unnamed marker", moment)
+        elif kind == "episode_end":
+            markers.pop(source, None)
+        elif event_id not in removed:
+            marker = markers.get(source)
+            group = (source, "marker", marker[1]) if marker else (
+                source, "day", datetime.datetime.fromtimestamp(moment).date())
+            counts[group] = counts.get(group, 0) + 1
+            if window["start"] <= moment <= window["end"]:
+                result.append({"time": moment, "number": counts[group], "note": d.get("note"),
+                               "zone": d.get("zone"), "subzone": d.get("subzone"), "character": character,
+                               "marker": marker[0] if marker else None,
+                               "since": moment - marker[1] if marker else None})
+    result.sort(key=lambda h: h["time"])
+    return result
+
+
+def figures(db, window_id, chart_range):
+    window = resolve_window(db, window_id)
+    return {"window": window, "range": chart_range, "start": start_figure(db, window),
+            "auction": auction_figure(db, window, chart_range), "value": value_figure(db, window, chart_range),
+            "costs": cost_figure(db, window), "highlights": highlights(db, window)}

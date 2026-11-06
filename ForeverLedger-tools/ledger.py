@@ -159,11 +159,13 @@ def connect(path):
     CREATE TABLE IF NOT EXISTS sources (
       source_id TEXT PRIMARY KEY, label TEXT, last_sequence INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS owners (name TEXT PRIMARY KEY);
-    CREATE VIEW IF NOT EXISTS cash_movements AS
+    DROP VIEW IF EXISTS cash_movements;
+    CREATE VIEW cash_movements AS
       SELECT id,source_id,character_name,time,episode,
         json_extract(data,'$.delta') AS copper,
         json_extract(data,'$.before') AS balance_before,
-        json_extract(data,'$.after') AS balance_after FROM events WHERE kind='balance';
+        json_extract(data,'$.after') AS balance_after FROM events WHERE kind='balance'
+        AND id NOT IN (SELECT json_extract(data,'$.balanceID') FROM events WHERE kind='balance_correction');
     CREATE VIEW IF NOT EXISTS activities AS
       SELECT id,source_id,character_name,time,episode,
         json_extract(data,'$.category') AS category,
@@ -209,12 +211,20 @@ def connect(path):
         json_extract(data,'$.quote.updatedAt') AS updated_at,
         json_extract(data,'$.quote.source') AS price_source,data
         FROM events WHERE kind='price';
+    DROP VIEW IF EXISTS highlights;
+    CREATE VIEW highlights AS
+      SELECT id,source_id,character_name,time,episode,
+        json_extract(data,'$.note') AS note,json_extract(data,'$.zone') AS zone,
+        json_extract(data,'$.subzone') AS subzone FROM events WHERE kind='highlight'
+        AND id NOT IN (SELECT json_extract(data,'$.highlightID') FROM events
+          WHERE kind='highlight_removed' AND json_extract(data,'$.highlightID') IS NOT NULL);
     """)
     return db
 
 
-def import_file(db, path):
-    obj = read_export(path)
+def import_file(db, path, export=None):
+    """Import one export. A caller that already parsed the file can pass it as `export`."""
+    obj = export if export is not None else read_export(path)
     added = 0
     highest = max((e["sequence"] for e in obj["events"]), default=0)
     with db:
@@ -246,13 +256,24 @@ def import_file(db, path):
     return added
 
 
+def character_key(name):
+    """The character a recorded name points to. Forever mail and trade names add a surname
+    ("Setha Bank") and the recording character's hidden realm, which is often not the
+    other character's, so only the first name identifies it."""
+    return name.split("-", 1)[0].strip().split(" ", 1)[0].casefold()
+
+
+def owned_keys(db):
+    return {character_key(r[0]) for r in db.execute("SELECT name FROM owners")}
+
+
 def all_events(db):
     return [json.loads(r[0]) for r in db.execute("SELECT raw FROM events ORDER BY time,source_id,sequence")]
 
 
 def report(db, costs=None):
     events = all_events(db)
-    owners = {r[0].casefold() for r in db.execute("SELECT name FROM owners")}
+    owners = owned_keys(db)
     balances, snapshots, items, unresolved, login_gaps = {}, {}, {}, [], []
     unmatched_returns, diagnostics = [], []
     valuations = {}
@@ -263,6 +284,12 @@ def report(db, costs=None):
         return items.setdefault(key, {"item_key":key,"name":item.get("name"),"listings":0,
             "sold_quantity":0,"gross":0,"commission":0,"cancellation_fees":0,"deposits_forfeited":0,
             "allocated_deposits_forfeited":0,"purchase_spend":0,"unmatched_sales":0})
+    corrected = {e["data"]["balanceID"] for e in events if e["kind"]=="balance_correction"}
+    # Backfilled corrections are appended; the record they cancel stays in the log.
+    voided = {e["data"][key] for e in events if e["kind"]=="activity"
+        for key in ("correctsActivityID","correctsSaleID") if e["data"].get(key)}
+    backfilled = {i for e in events if e["kind"]=="mail_backfill" and e["data"].get("status")=="applied"
+        for i in sequence(e["data"].get("reconciliationIDs"))}
     for e in events:
         d,k=e["data"],e["kind"]
         character=(e["sourceID"],e["character"])
@@ -270,12 +297,16 @@ def report(db, costs=None):
             balances[character]={"character":e["characterName"],"balance":d["balance"],"time":e["time"]}
             if d.get("gap"):
                 login_gaps.append({"event":e["id"],"gap":d["gap"]})
+        elif k=="balance" and e["id"] in corrected:
+            pass
         elif k=="balance":
             net += d["delta"]
             balances[character]={"character":e["characterName"],"balance":d["after"],"time":e["time"]}
+        elif k=="activity" and (e["id"] in voided or d.get("correctsActivityID")):
+            pass
         elif k=="activity":
             peer=d.get("counterparty") or d.get("sender") or d.get("recipient")
-            internal=d["category"] in ("trade","mail_received","mail_sent") and peer and peer.casefold() in owners
+            internal=d["category"] in ("trade","mail_received","mail_sent") and peer and character_key(peer) in owners
             if internal:
                 transfers += d["amount"]
             elif d["category"] in ("bank_deposit","bank_withdrawal"):
@@ -292,7 +323,7 @@ def report(db, costs=None):
                 item_row(d["item"])["purchase_spend"]+=-d["amount"]
             if d["category"]=="auction_cancel_fee":
                 cancel_fees.append(d)
-        elif k=="reconciliation" and d["residual"]:
+        elif k=="reconciliation" and d["residual"] and not corrected.intersection(d["balanceIDs"]) and e["id"] not in backfilled:
             unresolved.append({"event":e["id"],"residual":d["residual"]})
         elif k=="snapshot":
             snapshots[character+(d["location"],)]=e
@@ -308,7 +339,7 @@ def report(db, costs=None):
                 field="deposits_forfeited" if d["confidence"]=="server_id" else "allocated_deposits_forfeited"
                 row[field]+=d["depositLost"]
         elif k=="auction_sale":
-            sales.append(e)
+            if e["id"] not in voided: sales.append(e)
         elif k=="auction_return" and not d.get("auctionKey"):
             unmatched_returns.append({"event":e["id"],"item":d.get("item"),"failure":d.get("failure")})
         elif k in ("diagnostic","capability_missing"):
@@ -388,7 +419,7 @@ def report(db, costs=None):
 def export_csv(db, folder):
     folder=Path(folder)
     folder.mkdir(parents=True,exist_ok=True)
-    for view in ("events","cash_movements","activities","reconciliation","auction_sales","auction_outcomes","snapshots","valuations","prices"):
+    for view in ("events","cash_movements","activities","reconciliation","auction_sales","auction_outcomes","snapshots","valuations","prices","highlights"):
         cursor=db.execute(f"SELECT * FROM {view}")
         with (folder/(view+".csv")).open("w",encoding="utf-8",newline="") as out:
             writer=csv.writer(out)
