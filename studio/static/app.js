@@ -1,5 +1,6 @@
-import { attachHover, CHARTS, createFrames, exportPng, formatTime, moneyNode, renderForScreen, renderVideo, saveBlob, tableFor, VIDEO_HOLD_SECONDS, VideoCancelled } from "./charts.js";
+import { attachHover, breakdownGroups, CHARTS, createFrames, exportPng, formatTime, moneyNode, renderForScreen, renderVideo, saveBlob, tableFor, VIDEO_HOLD_SECONDS, VideoCancelled } from "./charts.js";
 import { COINS } from "./coins.js";
+import { drawVisual, QUALITY_COLORS, shownLines, valueWords, visualBlob } from "./visuals.js";
 
 const FORMATS = [["short", "Shorts"], ["long", "Longform"]];
 const STATUSES = [["idea", "Idea"], ["scripting", "Scripting"], ["recording", "Recording"], ["editing", "Editing"], ["published", "Published"]];
@@ -430,6 +431,7 @@ async function renderEpisode(id, tab) {
 
   const tabButton = (key, text) => h("button", { role: "tab", "aria-selected": String(tab === key), onclick: () => go(`#/episode/${id}/${key}`) }, text);
   const pane = h("div", {});
+  const visualsTab = tabButton("visuals", `Visuals (${episode.visuals.length})`);
   main.replaceChildren(h("div", { class: "page" },
     h("p", { class: "crumb" }, `${episode.series_name}  ·  ${episode.format === "short" ? "Short" : "Longform"}`),
     h("div", { class: "episode-head" }, title, status,
@@ -442,6 +444,7 @@ async function renderEpisode(id, tab) {
       } }, "Delete")),
     h("div", { class: "tabs", role: "tablist" },
       tabButton("script", "Script"), tabButton("shots", `Shots (${episode.shots.length})`), tabButton("data", "Data"),
+      visualsTab,
       h("span", { class: "tab-note", "data-save-state": "" })),
     pane));
   if (state.focusTitle) {
@@ -451,6 +454,7 @@ async function renderEpisode(id, tab) {
   }
   if (tab === "shots") renderShots(pane, episode);
   else if (tab === "data") await renderData(pane, episode);
+  else if (tab === "visuals") renderVisuals(pane, episode, visualsTab);
   else renderScript(pane, episode);
 }
 
@@ -654,7 +658,7 @@ async function renderData(pane, episode) {
       data.window_missing ? h("div", { class: "notice" }, `The saved window "${data.window_missing.replace(/^\w+:/, "")}" is not in this data, so this shows all recorded history.`) : "",
       highlightsCard(data.highlights || [], data.window),
       // A server started before a chart existed doesn't send it; the others still draw.
-      ...["start", "auction", "value", "costs"].filter((kind) => data[kind]).map((kind) => figureCard(kind, data, ctx, episode)),
+      ...["start", "auction", "value", "revenue", "costs"].filter((kind) => data[kind]).map((kind) => figureCard(kind, data, ctx, episode)),
       itemSection(episode, ctx));
   }
   await draw();
@@ -903,7 +907,7 @@ function figureCard(kind, data, ctx, episode) {
   const tableHost = h("div", { class: "table-wrap", hidden: true });
   const tableButton = h("button", { class: "button quiet", "aria-expanded": "false", onclick: () => {
     const opening = tableHost.hidden;
-    if (opening && !tableHost.firstChild) tableHost.append(dataTable(tableFor(kind, data)));
+    if (opening && !tableHost.firstChild) tableHost.append(dataTable(tableFor(kind, data, settings())));
     tableHost.hidden = !opening;
     tableButton.setAttribute("aria-expanded", String(opening));
     tableButton.textContent = opening ? "Hide table" : "Show table";
@@ -944,12 +948,18 @@ function figureCard(kind, data, ctx, episode) {
   };
   paintVideoTitle();
 
-  const card = h("article", { class: "figure-card" }, holder,
+  const breakdown = kind === "costs" || kind === "revenue";
+  const characterRow = breakdown ? characterPicker(data[kind], settings, saveSettings, () => {
+    paint();
+    if (tableHost.firstChild) tableHost.replaceChildren(dataTable(tableFor(kind, data, settings())));
+  }) : "";
+
+  const card = h("article", { class: "figure-card" }, holder, characterRow,
     h("div", { class: "figure-foot" },
       playButton, scrubber, durationSelect,
       h("div", { class: "segmented", role: "group", "aria-label": "Chart layout" }, viewButtons),
       // Bars of cost and item counts always start from nothing, so those have no axis choice.
-      ...(kind === "costs" || kind === "item" ? [] : [
+      ...(breakdown || kind === "item" ? [] : [
         h("span", { class: "foot-label" }, "Axis from"),
         h("div", { class: "segmented", role: "group", "aria-label": "Where the vertical axis starts" }, axisButtons),
         customField, axisWarning]),
@@ -970,6 +980,57 @@ function figureCard(kind, data, ctx, episode) {
   return card;
 }
 
+// A breakdown chart's choice of everyone together or chosen characters, each shown with
+// the colour its bars get. None ticked is never allowed: the last tick stays.
+function characterPicker(breakdown, settings, saveSettings, redraw) {
+  const characters = breakdown.characters ?? [];
+  const everyone = characters.map((c) => c.id);
+  const modeButtons = [[false, "All characters"], [true, "By character"]].map(([split, text]) => h("button", { onclick: () => {
+    saveSettings({ split });
+    update();
+  } }, text));
+  const chips = h("div", { class: "character-chips" });
+  const allButton = h("button", { class: "button quiet", onclick: () => { saveSettings({ characters: [] }); update(); } }, "Tick all");
+
+  function toggle(id, on) {
+    const stored = settings().characters ?? [];
+    const base = stored.length ? stored : everyone;
+    const next = on ? [...new Set([...base, id])] : base.filter((other) => other !== id);
+    if (!next.some((other) => everyone.includes(other))) {
+      paintPicker();
+      return;
+    }
+    saveSettings({ characters: everyone.every((other) => next.includes(other)) ? [] : next });
+    update();
+  }
+
+  function paintPicker() {
+    const { split, characters: chosen = [] } = settings();
+    modeButtons.forEach((button, i) => button.setAttribute("aria-pressed", String((i === 1) === Boolean(split))));
+    const groups = breakdownGroups(breakdown, settings()) ?? [];
+    chips.hidden = !split;
+    allButton.hidden = !split || !chosen.length || everyone.every((id) => chosen.includes(id));
+    chips.replaceChildren(...(characters.length ? characters.map((c) => {
+      const swatch = h("span", { class: "chip-swatch" });
+      const colour = groups.find((g) => g.ids.includes(c.id))?.color;
+      if (colour) swatch.style.background = colour;
+      return h("label", { class: "character-chip" },
+        h("input", { type: "checkbox", checked: !chosen.length || chosen.includes(c.id), "aria-label": `Show ${c.name}`,
+          onchange: (e) => toggle(c.id, e.target.checked) }),
+        swatch, c.name);
+    }) : [h("span", { class: "foot-label" }, "No character has any in this window")]));
+  }
+
+  function update() {
+    paintPicker();
+    redraw();
+  }
+
+  paintPicker();
+  return h("div", { class: "figure-options" },
+    h("div", { class: "segmented", role: "group", "aria-label": "Show figures for" }, modeButtons), chips, allButton);
+}
+
 function dataTable({ columns, numeric, rows }) {
   const cls = (i) => (numeric.includes(i) ? "num" : "");
   const cell = (value) => {
@@ -982,6 +1043,184 @@ function dataTable({ columns, numeric, rows }) {
   return h("table", { class: "data-table" },
     h("thead", {}, h("tr", {}, columns.map((c, i) => h("th", { class: cls(i), scope: "col" }, c)))),
     h("tbody", {}, rows.map((row) => h("tr", {}, row.map((value, i) => h("td", { class: cls(i) }, cell(value)))))));
+}
+
+// ---------- Visuals ----------
+
+const COPPER_PER = { gold: 10000, silver: 100, copper: 1 };
+const visualItems = new Map(); // "source:id" -> a promise of the item.
+
+function loadVisualItem(source, visual) {
+  const key = `${source}:${visual.item_id}`;
+  if (!visualItems.has(key)) {
+    const query = `id=${visual.item_id}&name=${encodeURIComponent(visual.name)}`;
+    const request = api("GET", `/api/visual/${source}/item?${query}`).then((item) => {
+      // A tooltip that couldn't be fetched is tried again the next time the tab opens.
+      if (!item.found) visualItems.delete(key);
+      return item;
+    }, (err) => { visualItems.delete(key); throw err; });
+    visualItems.set(key, request);
+  }
+  return visualItems.get(key);
+}
+
+const newKey = () => (crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`).slice(0, 36);
+
+// Item cards to overlay in the video: any item with its tooltip and a gold gain or loss.
+function renderVisuals(pane, episode, tabButton) {
+  const save = () => {
+    tabButton.textContent = `Visuals (${episode.visuals.length})`;
+    saveLater(`visuals-${episode.id}`, () => api("PATCH", `/api/episodes/${episode.id}`, { visuals: episode.visuals }));
+  };
+  const list = h("div", { class: "visual-list" });
+  const paintList = () => {
+    list.replaceChildren(...(episode.visuals.length
+      ? episode.visuals.map((visual) => visualCard(visual, episode, save, paintList))
+      : [h("div", { class: "empty-state" }, h("h2", {}, "No item cards yet"),
+        h("p", {}, "Search for any item above. Its tooltip appears with a gold amount beside it, ready to export for the video."))]));
+  };
+  pane.replaceChildren(itemSearch(episode, (found) => {
+    episode.visuals = [...episode.visuals, { key: newKey(), item_id: found.item_id, name: found.name, copper: 0, place: "right", sell: true, ilvl: true }];
+    save();
+    paintList();
+    list.lastElementChild?.querySelector(".visual-amount")?.focus();
+  }), list);
+  paintList();
+}
+
+// Finds items in this source's ledger first, then on Wowhead, as you type.
+function itemSearch(episode, onPick) {
+  const input = h("input", { type: "text", class: "visual-search-input", placeholder: "Search for any item, e.g. Linen Cloth",
+    "aria-label": "Search for an item", autocomplete: "off", role: "combobox", "aria-expanded": "false", "aria-controls": "visual-results" });
+  const results = h("ul", { class: "visual-results", id: "visual-results", role: "listbox", hidden: true });
+  let timer, asked = 0, active = -1, found = [];
+  const open = () => { results.hidden = false; input.setAttribute("aria-expanded", "true"); };
+  const close = () => { results.hidden = true; input.setAttribute("aria-expanded", "false"); active = -1; };
+  const pick = (item) => { close(); input.value = ""; found = []; onPick(item); };
+  const mark = (next) => {
+    active = next;
+    [...results.children].forEach((li, i) => li.setAttribute("aria-selected", String(i === active)));
+    results.children[active]?.scrollIntoView({ block: "nearest" });
+  };
+  async function search() {
+    const words = input.value.trim();
+    const ticket = ++asked;
+    const reply = await attempt(() => api("GET", `/api/visual/${episode.source}/search?q=${encodeURIComponent(words)}`));
+    if (!reply || ticket !== asked) return;
+    found = reply.items;
+    const row = (item) => h("li", { role: "option", "aria-selected": "false", onmousedown: (e) => { e.preventDefault(); pick(item); } },
+      h("span", { class: "visual-result-name", style: item.quality == null ? "" : `color: ${QUALITY_COLORS[item.quality]}` }, item.name),
+      h("span", { class: "visual-result-tag" }, item.in_ledger ? "In your ledger" : "Wowhead"));
+    results.replaceChildren(...(found.length ? found.map(row)
+      : [h("li", { class: "visual-result-none" }, words.length < 2 ? "Type at least two letters to search Wowhead too"
+        : reply.online ? "No item found by that name" : "Not in this ledger, and Wowhead search is off (--offline)")]));
+    open();
+    active = -1;
+  }
+  input.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(search, 250); });
+  input.addEventListener("focus", () => { if (found.length) open(); else search(); });
+  input.addEventListener("blur", close);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown" && found.length) { e.preventDefault(); open(); mark(Math.min(found.length - 1, active + 1)); }
+    if (e.key === "ArrowUp" && found.length) { e.preventDefault(); mark(Math.max(0, active - 1)); }
+    if (e.key === "Enter" && found[Math.max(0, active)]) { e.preventDefault(); pick(found[Math.max(0, active)]); }
+    if (e.key === "Escape") close();
+  });
+  return h("div", { class: "visual-search" }, h("span", { class: "filter-label" }, "Add item"),
+    h("div", { class: "visual-search-box" }, input, results),
+    h("span", { class: "figure-note" }, `Tooltips from Wowhead's ${episode.source === "tbc" ? "TBC" : "Forever"} data`));
+}
+
+function visualCard(visual, episode, save, repaintList) {
+  const holder = h("div", { class: "visual-holder" });
+  const note = h("p", { class: "visual-note", hidden: true });
+  let item = null;
+  const update = (changes) => {
+    Object.assign(visual, changes);
+    save();
+    paint();
+  };
+
+  let drawn = 0;
+  async function paint() {
+    if (!item) return;
+    const ticket = ++drawn;
+    const density = 2 * (window.devicePixelRatio || 1);
+    const canvas = await drawVisual(item, visual, density);
+    if (ticket !== drawn) return;
+    canvas.style.width = `${(canvas.width / density) * 1.25}px`; // A little larger than in the game.
+    canvas.setAttribute("role", "img");
+    const lines = shownLines(item, visual).slice(1).map((line) => line.left.map((s) => s.text).join(""));
+    canvas.setAttribute("aria-label", `${item.name}. ${lines.join(". ")}. ${valueWords(visual.copper)}`);
+    holder.replaceChildren(canvas);
+  }
+
+  // The amount is typed as gold, silver and copper, with gain or loss chosen beside it.
+  const abs = Math.abs(visual.copper);
+  const pieces = { gold: Math.floor(abs / 10000), silver: Math.floor(abs / 100) % 100, copper: abs % 100 };
+  let sign = visual.copper < 0 ? -1 : 1;
+  const amount = () => Object.entries(inputs).reduce((sum, [coin, el]) =>
+    sum + Math.min(coin === "gold" ? 99999999 : 99, Math.max(0, Math.floor(Number(el.value) || 0))) * COPPER_PER[coin], 0);
+  const commit = () => update({ copper: sign * amount() });
+  const inputs = Object.fromEntries(Object.keys(pieces).map((coin) => [coin, h("input", {
+    type: "number", class: `visual-amount ${coin}`, min: 0, max: coin === "gold" ? 99999999 : 99, step: 1,
+    value: pieces[coin] || "", placeholder: "0", "aria-label": `${coin[0].toUpperCase()}${coin.slice(1)} for ${visual.name}`, oninput: commit })]));
+  const signButtons = [["Gain", 1], ["Loss", -1]].map(([text, value]) => h("button", {
+    "aria-pressed": String(value === sign),
+    onclick: () => {
+      sign = value;
+      signButtons.forEach((b, i) => b.setAttribute("aria-pressed", String((i === 1) === (sign < 0))));
+      commit();
+    } }, text));
+  const placeButtons = [["right", "Beside"], ["below", "Below"]].map(([place, text], index) => h("button", {
+    "aria-pressed": String((visual.place || "right") === place),
+    onclick: () => {
+      placeButtons.forEach((b, i) => b.setAttribute("aria-pressed", String(i === index)));
+      update({ place });
+    } }, text));
+  const toggle = (flag, text) => h("label", { class: "character-chip" },
+    h("input", { type: "checkbox", checked: visual[flag] !== false, onchange: (e) => update({ [flag]: e.target.checked }) }), text);
+
+  const fileName = () => `${`${episode.title}-${item?.name || visual.name}`.replace(/[^\w-]+/g, "-").toLowerCase()}.png`;
+  const exportButton = h("button", { class: "button", disabled: true, title: "A transparent PNG at three times the game's tooltip size, to lay over footage",
+    onclick: () => attempt(async () => saveBlob((await visualBlob(item, visual)).blob, fileName())) }, "Export PNG");
+  const copyButton = h("button", { class: "button quiet", disabled: true, title: "Copies the transparent PNG, to paste into an editor",
+    onclick: () => attempt(async () => {
+      const { blob } = await visualBlob(item, visual);
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      copyButton.textContent = "Copied";
+      setTimeout(() => { copyButton.textContent = "Copy image"; }, 1500);
+    }) }, "Copy image");
+  const removeButton = h("button", { class: "icon-button", title: "Remove this card", "aria-label": `Remove ${visual.name}`, onclick: () => {
+    episode.visuals = episode.visuals.filter((other) => other.key !== visual.key);
+    save();
+    repaintList();
+  } }, icon("trash"));
+
+  const coinField = (coin) => h("span", { class: "axis-custom" }, inputs[coin], h("img", { class: "coin", src: COINS[coin], alt: coin }));
+  const card = h("article", { class: "figure-card visual-card" },
+    h("div", { class: "visual-stage" }, holder), note,
+    h("div", { class: "figure-foot" },
+      h("span", { class: "foot-label" }, "Amount"),
+      h("div", { class: "segmented", role: "group", "aria-label": "Gain or loss" }, signButtons),
+      coinField("gold"), coinField("silver"), coinField("copper"),
+      h("div", { class: "segmented", role: "group", "aria-label": "Where the amount goes" }, placeButtons),
+      toggle("ilvl", "Item level"), toggle("sell", "Sell price"),
+      h("span", { class: "spacer" }), copyButton, exportButton, removeButton));
+
+  holder.append(h("div", { class: "visual-note" }, `Loading ${visual.name}…`));
+  loadVisualItem(episode.source, visual).then((loaded) => {
+    item = loaded;
+    exportButton.disabled = copyButton.disabled = false;
+    if (!loaded.found) {
+      note.textContent = "Wowhead's tooltip couldn't be fetched (offline, or no such item), so only the name shows. It's tried again next time this tab opens.";
+      note.hidden = false;
+    }
+    paint();
+  }, (err) => {
+    holder.replaceChildren(h("p", { class: "visual-note" }, err.message));
+  });
+  return card;
 }
 
 // ---------- Sources ----------

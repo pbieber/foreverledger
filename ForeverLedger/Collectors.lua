@@ -1,6 +1,6 @@
 local _, F = ...
 F.context = {}
-F.pendingPosts, F.mailLeaving = {}, {}
+F.pendingPosts, F.mailLeaving, F.cancelling = {}, {}, {}
 
 function F.Call(fn, ...)
     if type(fn) ~= "function" then return nil end
@@ -564,6 +564,7 @@ function F.InstallHooks()
         if bid then F.Intent("auction_purchase_or_bid",-bid,{item=F.Item(F.Call(GetAuctionItemLink,list,index)),quantity=quantity}) end
     end)
     Hook(api,"CancelAuction",function(id)
+        F.cancelling[F.AuctionKey(id)]=F.Clock()
         local cost=F.Number(F.Call(api.GetCancelCost,id))
         if cost and cost>0 then F.Intent("auction_cancel_fee",-cost,{auctionID=id,auctionKey=F.AuctionKey(id)}) end
     end)
@@ -696,7 +697,7 @@ F.events={
         local d=F.pendingPosts[#F.pendingPosts]
         if d then d.awaitingConfirm=true end
     end,
-    AUCTION_CANCELED=function(id) F.AuctionOutcome(F.AuctionKey(id),"cancelled","server_id") end,
+    AUCTION_CANCELED=function(id) F.AuctionLeft(id) end,
     AUCTION_HOUSE_AUCTIONS_EXPIRED=function(id) F.AuctionOutcome(F.AuctionKey(id),"expired","server_id") end,
     COMMODITY_PRICE_UPDATED=function(unit,total) F.commodityQuote={unit=F.Number(unit),total=F.Number(total)} end,
     COMMODITY_PURCHASE_FAILED=function() F.commodityQuote=nil end,

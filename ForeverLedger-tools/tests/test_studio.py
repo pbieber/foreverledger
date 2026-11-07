@@ -23,6 +23,7 @@ import ledger  # noqa: E402
 import mockdata  # noqa: E402
 import store  # noqa: E402
 import studio  # noqa: E402
+import tooltips  # noqa: E402
 
 SOURCE = "Test:1:1"
 GUID, BANK_GUID = "Player-1", "Player-2"
@@ -172,6 +173,25 @@ class ChartSettingsTests(StudioTestCase):
             with self.assertRaises(store.Invalid, msg=bad):
                 store.update_episode(self.db, self.episode, {"chart_settings": bad})
 
+    def test_the_revenue_chart_keeps_its_own_character_split(self):
+        settings = {"revenue": {"split": True, "characters": ["Player-2"]}, "costs": {"split": False}}
+        store.update_episode(self.db, self.episode, {"chart_settings": settings})
+        saved = store.get_episode(self.db, self.episode)["chart_settings"]
+        self.assertEqual((saved["revenue"]["split"], saved["revenue"]["characters"]), (True, ["Player-2"]))
+        self.assertFalse(saved["costs"]["split"])
+
+    def test_the_cost_chart_keeps_its_character_split(self):
+        chosen = {"costs": {"split": True, "characters": ["Player-1", "Player-2", "Player-1"]}}
+        store.update_episode(self.db, self.episode, {"chart_settings": chosen})
+        saved = store.get_episode(self.db, self.episode)["chart_settings"]["costs"]
+        self.assertEqual((saved["split"], saved["characters"]), (True, ["Player-1", "Player-2"]))
+        store.update_episode(self.db, self.episode, {"chart_settings": {"costs": {"seconds": 5}}})
+        saved = store.get_episode(self.db, self.episode)["chart_settings"]["costs"]
+        self.assertEqual((saved["split"], saved["characters"]), (False, []))
+        for bad in ({"split": "yes"}, {"characters": "Player-1"}, {"characters": [""]}, {"characters": [7]}):
+            with self.assertRaises(store.Invalid, msg=bad):
+                store.update_episode(self.db, self.episode, {"chart_settings": {"costs": bad}})
+
     def test_a_new_episode_has_no_settings(self):
         self.assertEqual(store.get_episode(self.db, self.episode)["chart_settings"], {})
 
@@ -200,6 +220,125 @@ class ChartSettingsTests(StudioTestCase):
         self.addCleanup(upgraded.close)
         loaded = store.get_episode(upgraded, 7)
         self.assertEqual((loaded["title"], loaded["chart_settings"]), ("Keep me", {}))
+
+
+class VisualsStoreTests(StudioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.db = store.connect(self.folder / "plan.sqlite")
+        self.addCleanup(self.db.close)
+        self.episode = store.add_episode(self.db, store.add_series(self.db, "Series", "short"))
+
+    def test_cards_keep_their_item_signed_amount_and_choices(self):
+        cards = [{"key": "a", "item_id": 2589, "name": "Linen Cloth", "copper": -120000},
+                 {"key": "b", "item_id": 19019, "name": "Thunderfury", "copper": 15000000, "place": "below", "sell": False}]
+        store.update_episode(self.db, self.episode, {"visuals": cards})
+        saved = store.get_episode(self.db, self.episode)["visuals"]
+        self.assertEqual(saved[0], {"key": "a", "item_id": 2589, "name": "Linen Cloth", "copper": -120000,
+                                    "place": "right", "sell": True, "ilvl": True})
+        self.assertEqual((saved[1]["place"], saved[1]["sell"], saved[1]["copper"]), ("below", False, 15000000))
+
+    def test_a_new_episode_has_no_cards(self):
+        self.assertEqual(store.get_episode(self.db, self.episode)["visuals"], [])
+
+    def test_bad_cards_are_refused(self):
+        good = {"key": "a", "item_id": 1, "name": "x", "copper": 5}
+        for bad in ({}, [dict(good, item_id=0)], [dict(good, item_id=True)], [dict(good, copper=1.5)],
+                    [dict(good, copper=10 ** 15)], [dict(good, key="")], [dict(good, place="left")],
+                    [dict(good, sell="no")], [good, good], [good] * 101, ["card"]):
+            with self.assertRaises(store.Invalid, msg=bad):
+                store.update_episode(self.db, self.episode, {"visuals": bad})
+
+
+THUNDERFURY = ('<table><tr><td><!--nstart--><b class="q5">Thunderfury</b><!--nend--><span class="q"><br>Item Level '
+               '<!--ilvl-->80</span><br>Binds when picked up<table width="100%"><tr><td>One-Hand</td><th>'
+               '<span class="q1">Sword</span></th></tr></table><span class="q2">Chance on hit: <a href="/x" '
+               'class="q2">Blasts&nbsp;your enemy.</a></span><script>alert(1)</script><br><div class="whtt-sellprice">'
+               'Sell Price: <span class="moneygold">25</span> <span class="moneysilver">53</span></div></td></tr></table>')
+
+
+class TooltipTests(StudioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.requests = []
+        self.replies = {}
+
+    def fetch(self, url):
+        self.requests.append(url)
+        for fragment, reply in self.replies.items():
+            if fragment in url:
+                return reply
+        raise OSError("unexpected request")
+
+    def tips(self, **options):
+        return tooltips.TooltipStore(self.folder / "tips", fetch=self.fetch, **options)
+
+    def test_tooltip_html_becomes_coloured_lines_with_a_right_column_and_coins(self):
+        lines = tooltips.parse_tooltip(THUNDERFURY)
+        text = lambda spans: "".join(s["text"] for s in spans)
+        self.assertEqual([text(line["left"]) for line in lines],
+                         ["Thunderfury", "Item Level 80", "Binds when picked up", "One-Hand",
+                          "Chance on hit: Blasts your enemy.", "Sell Price: 25 53"])
+        self.assertEqual(lines[0]["left"][0]["color"], "q5")
+        self.assertEqual(lines[1]["left"][0]["color"], "q")
+        self.assertEqual(lines[3]["right"], [{"text": "Sword", "color": "q1"}])
+        self.assertEqual(lines[4]["left"][0]["color"], "q2")
+        self.assertTrue(lines[5]["sell"])
+        self.assertEqual([s.get("coin") for s in lines[5]["left"] if s.get("coin")], ["gold", "silver"])
+        self.assertFalse(any(line["sell"] for line in lines[:5]))
+
+    def test_tooltips_are_fetched_from_the_sources_section_once(self):
+        self.replies["forever/tooltip/item/19019"] = json.dumps(
+            {"name": "Thunderfury", "quality": 5, "icon": "inv_sword_39", "tooltip": THUNDERFURY}).encode()
+        tip = self.tips().item(19019, "mock")
+        self.assertEqual((tip["name"], tip["quality"], tip["icon_name"]), ("Thunderfury", 5, "inv_sword_39"))
+        self.assertEqual(self.tips().item(19019, "mock")["lines"], tip["lines"])
+        self.assertEqual(len(self.requests), 1)
+
+    def test_no_network_gives_nothing_and_stops_trying_for_a_while(self):
+        store_ = self.tips()
+        self.assertIsNone(store_.item(1, "tbc"))
+        self.assertIsNone(store_.item(2, "tbc"))
+        self.assertEqual(store_.search("linen", "tbc"), [])
+        self.assertEqual(len(self.requests), 1)
+
+    def test_a_garbled_reply_counts_as_not_found_for_a_while(self):
+        self.replies["tooltip"] = b"not json"
+        store_ = self.tips()
+        self.assertIsNone(store_.item(1, "tbc"))
+        self.assertIsNone(store_.item(1, "tbc"))
+        self.assertEqual(len(self.requests), 1)
+
+    def test_offline_never_makes_a_request(self):
+        store_ = self.tips(online=False)
+        self.assertIsNone(store_.item(1, "tbc"))
+        self.assertEqual(store_.search("linen", "tbc"), [])
+        self.assertEqual(self.requests, [])
+
+    def test_search_keeps_only_items(self):
+        self.replies["tbc/search"] = json.dumps({"results": [
+            {"type": 3, "id": 2589, "name": "Linen Cloth", "quality": 1},
+            {"type": 6, "id": 7, "name": "Linen spell"},
+            {"type": 3, "id": "x", "name": "Bad id"},
+            {"type": 3, "id": 4238, "name": "Linen Bag", "quality": 99}]}).encode()
+        found = self.tips().search("linen", "tbc")
+        self.assertEqual(found, [{"item_id": 2589, "name": "Linen Cloth", "quality": 1},
+                                 {"item_id": 4238, "name": "Linen Bag", "quality": 1}])
+
+
+class ItemCatalogTests(StudioTestCase):
+    def test_named_items_match_the_words_with_name_starts_first(self):
+        e = Events()
+        e.add("loot_message", {"text": "You receive loot: |cffffffff|Hitem:2589::::::::|h[Linen Cloth]|h|r"}, 100)
+        e.add("auction_sale", {"item": {"id": 4238, "name": "Linen Bag"}}, 110)
+        e.add("auction_sale", {"item": {"id": 5762, "name": "Red Linen Bag"}}, 120)
+        e.add("auction_sale", {"item": {"id": 2840, "name": "Copper Bar"}}, 130)
+        db = e.database(self.folder)
+        self.addCleanup(db.close)
+        self.assertEqual([i["name"] for i in analytics.item_catalog(db, "linen")],
+                         ["Linen Bag", "Linen Cloth", "Red Linen Bag"])
+        self.assertEqual(len(analytics.item_catalog(db, "")), 4)
+        self.assertEqual(analytics.item_catalog(db, "bar")[0], {"item_id": 2840, "name": "Copper Bar"})
 
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"icon"
@@ -435,6 +574,43 @@ class WindowTests(StudioTestCase):
         self.addCleanup(db.close)
         window = analytics.resolve_window(db, "marker:Day 1")
         self.assertEqual((window["start"], window["end"]), (1000, 1800))
+
+    def test_a_new_marker_on_one_account_ends_the_old_one_on_both(self):
+        e = Events()
+        e.add("episode_start", {"name": "Day 1"}, 1000)
+        e.add("episode_start", {"name": "Day 1"}, 1100, source="Other:1:1")
+        e.add("episode_start", {"name": "Day 2"}, 2000, source="Other:1:1")
+        e.add("logout", {}, 3000)
+        e.add("logout", {}, 2900, source="Other:1:1")
+        db = e.database(self.folder)
+        self.addCleanup(db.close)
+        windows = {w["id"]: w for w in analytics.windows(db)}
+        self.assertEqual((windows["marker:Day 1"]["start"], windows["marker:Day 1"]["end"]), (1000, 2000))
+        self.assertEqual((windows["marker:Day 2"]["start"], windows["marker:Day 2"]["end"]), (2000, 3000))
+
+    def test_an_account_whose_marker_ended_stays_out_of_the_new_one(self):
+        e = Events()
+        e.add("episode_start", {"name": "Day 1"}, 1000)
+        e.add("episode_end", {}, 1500)
+        e.add("episode_start", {"name": "Day 2"}, 2000, source="Other:1:1")
+        e.add("logout", {}, 3000)
+        e.add("logout", {}, 2500, source="Other:1:1")
+        db = e.database(self.folder)
+        self.addCleanup(db.close)
+        windows = {w["id"]: w for w in analytics.windows(db)}
+        self.assertEqual((windows["marker:Day 1"]["start"], windows["marker:Day 1"]["end"]), (1000, 1500))
+        self.assertEqual((windows["marker:Day 2"]["start"], windows["marker:Day 2"]["end"]), (2000, 2500))
+
+    def test_the_same_label_started_on_the_other_account_keeps_running(self):
+        e = Events()
+        e.add("episode_start", {"name": "Day 1"}, 1000)
+        e.add("episode_start", {"name": "Day 1"}, 1200, source="Other:1:1")
+        e.add("logout", {}, 3000)
+        e.add("logout", {}, 2500, source="Other:1:1")
+        db = e.database(self.folder)
+        self.addCleanup(db.close)
+        window = analytics.resolve_window(db, "marker:Day 1")
+        self.assertEqual((window["start"], window["end"]), (1000, 3000))
 
     def test_unknown_window_is_reported(self):
         e = Events()
@@ -727,6 +903,86 @@ class CostFigureTests(StudioTestCase):
         e.activity("auction_cancel_fee", -25, 1700, auctionID=2)
         self.assertEqual(self.figure(e)["parts"]["listing_fees"], 125)
 
+    # Earlier addon versions marked Forever auctions cancelled when they sold or expired.
+    LEGS = {"id": 9789, "name": "Raider's Legguards of Magic"}
+
+    def listing(self, e, key, at, quantity=1, total=7500, deposit=148, item=LEGS):
+        e.add("auction_posted", {"key": key, "character": GUID, "item": item, "quantity": quantity,
+                                 "totalPrice": total, "deposit": deposit}, at)
+
+    def falsely_cancelled(self, e, key, at, quantity=1, deposit=148, item=LEGS):
+        e.add("auction_outcome", {"auctionKey": key, "item": item, "quantity": quantity, "outcome": "cancelled",
+                                  "confidence": "server_id", "depositLost": deposit}, at)
+
+    def sale_mail(self, e, at, quantity=1, gross=7500, refund=148, key=None, item=LEGS):
+        sale = {"item": item, "quantity": quantity, "gross": gross, "depositRefund": refund,
+                "commission": gross // 20, "matchConfidence": "unmatched" if key is None else "inferred_unique"}
+        if key:
+            sale["auctionKey"] = key
+        sale_id = e.add("auction_sale", sale, at)
+        e.activity("auction_sale", gross - gross // 20 + refund, at, saleID=sale_id, item=item, quantity=quantity,
+                   gross=gross, commission=gross // 20, depositRefund=refund)
+
+    def test_a_cancelled_auction_whose_sale_mail_came_later_lost_nothing(self):
+        e = Events()
+        self.listing(e, "P:1073672", 1100)
+        self.falsely_cancelled(e, "P:1073672", 1400)
+        self.sale_mail(e, 1700)
+        self.assertEqual(self.figure(e)["parts"]["listing_fees"], 0)
+
+    def test_a_later_sold_outcome_replaces_a_cancel(self):
+        e = Events()
+        self.listing(e, "P:1", 1100)
+        self.falsely_cancelled(e, "P:1", 1400)
+        e.add("auction_outcome", {"auctionKey": "P:1", "item": self.LEGS, "quantity": 1, "outcome": "sold",
+                                  "replaces": "cancelled"}, 1700)
+        self.assertEqual(self.figure(e)["parts"]["listing_fees"], 0)
+
+    def test_a_sale_of_another_price_does_not_refund_a_cancel(self):
+        e = Events()
+        self.listing(e, "P:1", 1100)
+        self.falsely_cancelled(e, "P:1", 1400)
+        self.sale_mail(e, 1700, gross=7000)
+        self.sale_mail(e, 1300)  # Before the auction left the house.
+        self.assertEqual(self.figure(e)["parts"]["listing_fees"], 148)
+
+    def test_a_partly_sold_commodity_loses_only_the_rest_of_its_deposit(self):
+        e = Events()
+        eye = {"id": 730, "name": "Murloc Eye"}
+        self.listing(e, "P:1", 1100, quantity=2, total=2498, deposit=100, item=eye)
+        self.falsely_cancelled(e, "P:1", 1150, quantity=2, deposit=100, item=eye)
+        self.sale_mail(e, 1600, quantity=1, gross=1249, refund=50, item=eye)
+        self.assertEqual(self.figure(e)["parts"]["listing_fees"], 50)
+
+    def test_a_relisted_items_sale_refunds_the_relisting_not_the_expired_one(self):
+        e = Events()
+        self.listing(e, "P:1", 1100)
+        self.falsely_cancelled(e, "P:1", 1300)  # Expired.
+        self.listing(e, "P:2", 1400)
+        self.falsely_cancelled(e, "P:2", 1500)  # Sold.
+        self.sale_mail(e, 1600)
+        # The same mail read again without its money taken is not a second refund.
+        e.activity("auction_sale", 0, 1650, item=self.LEGS, quantity=1, gross=7500, depositRefund=148)
+        db = e.database(self.folder)
+        self.addCleanup(db.close)
+        losses = analytics._lost_listing_fees(db, analytics._activities(db))
+        self.assertEqual(losses, [(1300, 148, GUID)])
+
+    def test_a_sale_linked_to_its_auction_refunds_only_that_auction(self):
+        e = Events()
+        self.listing(e, "P:1", 1100)
+        self.falsely_cancelled(e, "P:1", 1300)
+        self.listing(e, "P:2", 1400)
+        self.falsely_cancelled(e, "P:2", 1500)
+        self.sale_mail(e, 1600, key="P:1")
+        self.assertEqual(self.figure(e)["parts"]["listing_fees"], 148)
+
+    def test_the_cut_of_a_sale_mail_read_again_without_its_money_is_not_counted_twice(self):
+        e = Events()
+        e.activity("auction_sale", 0, 1100, item={"name": "Scroll"}, gross=2100, commission=100)
+        e.activity("auction_sale", 2000, 1101, item={"name": "Scroll"}, gross=2100, commission=100)
+        self.assertEqual(self.figure(e)["parts"]["ah_cut"], 100)
+
     def test_a_listing_still_up_costs_nothing_yet(self):
         e = Events()
         e.activity("auction_deposit", -300, 1100, item={"name": "Iron Bar"}, quantity=5)
@@ -747,6 +1003,107 @@ class CostFigureTests(StudioTestCase):
         figure = self.figure(e)
         self.assertFalse(figure["has_activity"])
         self.assertEqual(len(figure["rows"]), 6)
+
+    def test_each_character_has_its_own_share_of_every_row(self):
+        e = Events()
+        alt = (BANK_GUID, "Alt-Realm")
+        e.activity("repair", -300, 1100)
+        e.activity("repair", -50, 1200, character=alt)
+        e.activity("flight", -20, 1300, character=alt)
+        e.activity("auction_sale", 950, 1400, item={"name": "Silk"}, quantity=1, commission=40, character=alt)
+        figure = self.figure(e)
+        rows = {row["key"]: row["by_character"] for row in figure["rows"]}
+        self.assertEqual(rows["repair"], {GUID: 300, BANK_GUID: 50})
+        self.assertEqual((rows["flight"], rows["ah_fees"]), ({BANK_GUID: 20}, {BANK_GUID: 40}))
+        self.assertEqual(figure["parts_by_character"][BANK_GUID]["ah_cut"], 40)
+        self.assertEqual([(c["name"], c["total"]) for c in figure["characters"]], [("Main", 300), ("Alt", 110)])
+
+    def test_a_character_keeps_its_place_in_line_whatever_the_window(self):
+        e = Events()
+        alt = (BANK_GUID, "Alt-Realm")
+        e.activity("loot", 5, 500)  # Main is seen first, long before the window.
+        e.activity("repair", -50, 1200, character=alt)
+        e.activity("repair", -10, 1300)
+        self.assertEqual([(c["name"], c["slot"]) for c in self.figure(e)["characters"]], [("Main", 0), ("Alt", 1)])
+
+    def test_a_returned_listing_takes_its_own_characters_deposit(self):
+        e = Events()
+        alt = (BANK_GUID, "Alt-Realm")
+        item = {"name": "Flame Cap"}
+        e.activity("auction_deposit", -100, 1100, item=item, quantity=5)
+        e.activity("auction_deposit", -700, 1200, item=item, quantity=5, character=alt)
+        e.add("auction_return", {"item": item, "quantity": 5, "failure": "expired"}, 1300, character=alt)
+        rows = {row["key"]: row["by_character"] for row in self.figure(e)["rows"]}
+        self.assertEqual(rows["ah_fees"], {BANK_GUID: 700})
+
+    def test_two_characters_with_one_name_keep_their_realms(self):
+        e = Events()
+        e.activity("repair", -1, 1100, character=("Player-A", "Same-One"))
+        e.activity("repair", -2, 1200, character=("Player-B", "Same-Two"))
+        self.assertEqual(sorted(c["name"] for c in self.figure(e)["characters"]), ["Same-One", "Same-Two"])
+
+
+class RevenueFigureTests(StudioTestCase):
+    WINDOW = {"start": 1000, "end": 2000}
+
+    def figure(self, e):
+        db = e.database(self.folder)
+        self.addCleanup(db.close)
+        return analytics.revenue_figure(db, self.WINDOW)
+
+    @staticmethod
+    def values(figure):
+        return {row["key"]: row["value"] for row in figure["rows"]}
+
+    def test_each_source_lands_in_its_row_and_rows_add_up_to_the_total(self):
+        e = Events()
+        e.activity("loot", 30, 1100)
+        e.activity("quest", 200, 1200)
+        e.activity("vendor_sale", 45, 1300)
+        e.activity("trade", 500, 1400, counterparty="Stranger")
+        e.activity("mail_cod", 80, 1450, sender="Buyer-Realm")
+        e.activity("repair", -300, 1500)
+        figure = self.figure(e)
+        self.assertEqual(self.values(figure), {"ah_sales": 0, "loot": 30, "quest": 200, "vendor_sale": 45, "players": 580})
+        self.assertEqual(figure["total"], 855)
+        self.assertEqual(figure["rows"][0]["key"], "players")
+
+    def test_a_sale_counts_at_the_buyers_price_and_explains_what_was_collected(self):
+        e = Events()
+        e.activity("auction_sale", 2300, 1100, item={"name": "Scroll"}, gross=2100, commission=100, depositRefund=300)
+        e.activity("auction_sale", 950, 1200, item={"name": "Silk"}, commission=50)  # No price on record.
+        figure = self.figure(e)
+        self.assertEqual(self.values(figure)["ah_sales"], 3100)
+        self.assertEqual(figure["parts"], {"sold_for": 3100, "ah_cut": 150, "deposits_back": 300, "collected": 3250})
+        self.assertEqual(figure["rows"][0]["count"], 2)
+
+    def test_a_sale_mail_read_again_without_its_money_is_not_another_sale(self):
+        e = Events()
+        e.activity("auction_sale", 0, 1100, item={"name": "Scroll"}, gross=2100, commission=100)
+        e.activity("auction_sale", 2000, 1101, item={"name": "Scroll"}, gross=2100, commission=100)
+        self.assertEqual(self.values(self.figure(e))["ah_sales"], 2100)
+
+    def test_gold_from_own_characters_and_returned_bids_is_not_revenue(self):
+        e = Events()
+        e.add("baseline", {"balance": 0}, 900, character=(BANK_GUID, "Alt-Realm"))
+        e.activity("mail_received", 600, 1100, sender="Alt-Realm")
+        e.activity("trade", 300, 1200, counterparty="Alt Bank-Realm2")
+        e.activity("mail_received", 500, 1300, sender="Alliance Auction House-Realm")
+        e.activity("trade", -50, 1400, counterparty="Stranger")
+        figure = self.figure(e)
+        self.assertEqual(figure["total"], 0)
+        self.assertFalse(figure["has_activity"])
+
+    def test_revenue_outside_the_window_is_left_out_and_split_per_character(self):
+        e = Events()
+        alt = (BANK_GUID, "Alt-Realm")
+        e.activity("quest", 999, 900)
+        e.activity("quest", 100, 1100)
+        e.activity("quest", 40, 1200, character=alt)
+        figure = self.figure(e)
+        quests = next(row for row in figure["rows"] if row["key"] == "quest")
+        self.assertEqual((quests["value"], quests["by_character"]), (140, {GUID: 100, BANK_GUID: 40}))
+        self.assertEqual([c["name"] for c in figure["characters"]], ["Main", "Alt"])
 
 
 class ValueFigureTests(StudioTestCase):
@@ -1161,6 +1518,23 @@ class ServerTests(StudioTestCase):
         figures = self.api("GET", "/api/data/mock/figures?window=marker:Gone&range=window")
         self.assertEqual(figures["window_missing"], "marker:Gone")
         self.assertEqual(figures["window"]["id"], "all")
+
+    def test_visual_search_lists_ledger_items_and_the_item_falls_back_to_its_name_offline(self):
+        e = Events()
+        e.add("auction_sale", {"item": {"id": 4238, "name": "Linen Bag"}}, 110)
+        path = self.folder / "account.json"
+        path.write_text(json.dumps({"schema": 1, "sourceID": SOURCE, "events": e.events}), encoding="utf-8")
+        self.assertTrue(self.app.import_path("tbc", str(path))["ok"])
+        found = self.api("GET", "/api/visual/tbc/search?q=linen")
+        self.assertEqual(found["items"], [{"item_id": 4238, "name": "Linen Bag", "in_ledger": True}])
+        self.assertEqual(self.api("GET", "/api/visual/forever/search?q=linen")["items"], [])
+        item = self.api("GET", "/api/visual/tbc/item?id=4238&name=Linen%20Bag")
+        self.assertEqual((item["name"], item["found"], item["lines"]), ("Linen Bag", False, []))
+        self.assertIn("icon", item)
+        self.assertNotIn("icon_name", item)
+        for bad in ("id=x", "id=0", ""):
+            self.assertEqual(self.request("GET", f"/api/visual/tbc/item?{bad}")[0], 400)
+        self.assertEqual(self.request("GET", "/api/visual/nope/item?id=1")[0], 404)
 
     def test_episode_round_trip(self):
         series = self.api("POST", "/api/series", {"name": "New", "format": "long"})["id"]

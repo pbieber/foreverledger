@@ -143,6 +143,7 @@ function F.Init(db, identity)
     F.RepairLogoutBalances()
     if F.BackfillMail then F.BackfillMail() end
     if F.RepairPostage then F.RepairPostage() end
+    if F.RepairPeerHistory then F.RepairPeerHistory() end
     if F.InitValuation then F.InitValuation() end
 end
 
@@ -339,14 +340,34 @@ function F.Posted(id, details)
     if d.deposit then F.Claim("auction_deposit", -d.deposit, {auctionKey=key, item=d.item}) end
 end
 
+-- Earlier versions read Forever's AUCTION_CANCELED as a cancel, and sold auctions were
+-- left marked cancelled. A sale proven by mail replaces a cancel; nothing else does.
 function F.AuctionOutcome(key, outcome, confidence, evidenceID)
     local a = F.db.auctions[key]
-    if not a or a.outcome then return false end
+    if not a then return false end
+    local replaces = a.outcome == "cancelled" and outcome == "sold" and evidenceID and a.outcome or nil
+    if a.outcome and not replaces then return false end
     a.outcome, a.status = outcome, outcome
     a.outcomeConfidence = confidence
     F.Emit("auction_outcome", {auctionKey=key, item=a.item, quantity=a.quantity,
         outcome=outcome, depositLost=(outcome=="expired" or outcome=="cancelled") and a.deposit or nil,
-        confidence=confidence, evidenceID=evidenceID})
+        confidence=confidence, evidenceID=evidenceID, replaces=replaces, leftAt=a.leftAt})
+    return true
+end
+
+-- Forever (1.60.1) fires AUCTION_CANCELED whenever an owned auction leaves the house:
+-- when it sells, even in part, and when it expires, not only when it is cancelled.
+-- Only the player's own cancel makes it a cancellation. Otherwise the time is kept,
+-- since it is when the auction sold or ran out, and the mail that follows says which.
+function F.AuctionLeft(id)
+    local key = F.AuctionKey(id)
+    local asked = F.cancelling[key]
+    F.cancelling[key] = nil
+    if asked and F.Clock() - asked < 60 then return F.AuctionOutcome(key, "cancelled", "player_cancel") end
+    local a = F.db.auctions[key]
+    if not a or a.outcome then return false end
+    a.leftAt = a.leftAt or F.Now()
+    F.Emit("auction_left", {auctionKey=key, item=a.item, quantity=a.quantity})
     return true
 end
 
@@ -354,8 +375,19 @@ end
 -- never presented as a server-confirmed link. No match is better than a false one.
 function F.MatchAuction(item, quantity, gross, refund, failure)
     local candidates = {}
+    -- A seller mail may still belong to an auction marked cancelled (see F.AuctionOutcome).
+    local function open(a)
+        if not a.outcome then return true end
+        if failure then return a.outcome == failure and not a.returnMailRecorded end
+        return a.outcome == "cancelled"
+    end
+    -- What the server already said about an auction comes first, a cancel being overturned last.
+    local function rank(a)
+        if a.outcome then return a.outcome == failure and 0 or 3 end
+        return a.leftAt and 1 or 2
+    end
     for key, a in pairs(F.db.auctions) do
-        if a.character == F.identity.guid and (not a.outcome or (failure and a.outcome==failure and not a.returnMailRecorded)) and a.quantity == quantity
+        if a.character == F.identity.guid and open(a) and a.quantity == quantity
             and ((item.id and a.item and a.item.id == item.id) or
                 (not item.id and a.item and a.item.name == item.name))
             and (not gross or a.totalPrice == gross)
@@ -364,7 +396,7 @@ function F.MatchAuction(item, quantity, gross, refund, failure)
         end
     end
     table.sort(candidates, function(a,b)
-        if failure and (a.data.outcome~=nil) ~= (b.data.outcome~=nil) then return a.data.outcome~=nil end
+        if rank(a.data) ~= rank(b.data) then return rank(a.data) < rank(b.data) end
         if a.data.postedAt == b.data.postedAt then return a.key < b.key end
         return a.data.postedAt < b.data.postedAt
     end)

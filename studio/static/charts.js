@@ -8,6 +8,7 @@ export const CHARTS = {
   auction: "Auction house activity",
   value: "Total value",
   costs: "Cost breakdown",
+  revenue: "Revenue breakdown",
   item: "Item analysis",
 };
 
@@ -533,69 +534,148 @@ function valueFigure(data, ctx, options) {
   return { svg: shell(L, head.svg + big.svg + out), hover, anim: chart.anim, axis };
 }
 
-// ---------- Cost breakdown ----------
+// ---------- Cost and revenue breakdowns ----------
 
-const COST_NOUNS = { class_training: ["lesson", "lessons"], profession_training: ["lesson", "lessons"], repair: ["repair", "repairs"],
-  flight: ["flight", "flights"], ah_fees: ["listing lost", "listings lost"], ah_purchases: ["purchase", "purchases"] };
-const countText = (key, count) => `${number.format(count)} ${COST_NOUNS[key][count === 1 ? 0 : 1]}`;
+// What differs between the two breakdowns; the drawing, picker and table are shared.
+// `details` are the parts listed under a row in the table, `side` the list beside the bars.
+const plain = (list) => list.map((row) => ({ signed: false, ...row }));
+const BREAKDOWNS = {
+  costs: {
+    column: "Cost", totalLabel: "Total costs", color: C.spent, partColor: C.spentLight,
+    empty: "No costs recorded in this window", noneChosen: "None of these characters spent anything in this window",
+    nouns: { class_training: ["lesson", "lessons"], profession_training: ["lesson", "lessons"], repair: ["repair", "repairs"],
+      flight: ["flight", "flights"], ah_fees: ["listing lost", "listings lost"], ah_purchases: ["purchase", "purchases"] },
+    details: {
+      ah_fees: [{ label: "Unsold listing fees", key: "listing_fees" }, { label: "Auction house cut", key: "ah_cut" }],
+      ah_purchases: [{ label: "Bought", key: "bought", when: (p) => p.bid_refunds },
+        { label: "Bids sent back", key: "bid_refunds", sign: -1, when: (p) => p.bid_refunds }],
+    },
+    side: (p, groups) => [
+      { heading: "Auction house costs", rows: plain([
+        { label: "Unsold listing fees", copper: p.listing_fees, ...(groups ? {} : { swatch: C.spent }) },
+        { label: "Auction house cut", copper: p.ah_cut, ...(groups ? {} : { swatch: C.spentLight }) },
+      ]) },
+      ...(groups ? [] : [{ heading: "Auction house purchases", rows: plain([
+        { label: "Bought", copper: p.bought },
+        ...(p.bid_refunds ? [{ label: "Bids sent back", copper: -p.bid_refunds }] : []),
+      ]) }]),
+    ],
+  },
+  revenue: {
+    column: "Revenue", totalLabel: "Total revenue", color: C.sold,
+    empty: "No revenue recorded in this window", noneChosen: "None of these characters earned anything in this window",
+    nouns: { ah_sales: ["sale", "sales"], loot: ["pickup", "pickups"], quest: ["quest", "quests"], vendor_sale: ["sale", "sales"],
+      players: ["payment", "payments"] },
+    details: {
+      ah_sales: [{ label: "Auction house cut", key: "ah_cut", sign: -1 }, { label: "Deposits back", key: "deposits_back", sign: 1 },
+        { label: "Collected", key: "collected" }],
+    },
+    // Sales count at the buyer's price; this shows how that became the gold collected.
+    side: (p) => [{ heading: "Auction house sales", rows: plain([
+      { label: "Sold for", copper: p.sold_for },
+      { label: "Auction house cut", copper: -p.ah_cut, signed: true },
+      { label: "Deposits back", copper: p.deposits_back, signed: true },
+      { label: "Collected", copper: p.collected },
+    ]) }],
+  },
+};
+const countText = (kind, key, count) => `${number.format(count)} ${BREAKDOWNS[kind].nouns[key][count === 1 ? 0 : 1]}`;
 
-// One labelled bar per cost, largest first, growing in turn. Auction house costs
-// stack their two parts, keyed by colour in the list beside the bars.
-function costFigure(data, ctx, options) {
+// One colour per character, checked for colour-blind separation on this surface.
+// A ninth character is never a made-up colour: past eight, the rest share grey.
+export const CHARACTER_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"];
+
+// The colour groups a breakdown's settings ask for, or null for all characters
+// together. None chosen means all. A character's colour follows its fixed place among
+// everyone with money in the window, so ticking another never repaints it. With more
+// than eight there aren't enough colours for that: then the chosen take them in
+// order, and past eight the seven with the most keep theirs.
+export function breakdownGroups(breakdown, settings) {
+  if (!settings?.split) return null;
+  const all = breakdown.characters ?? [];
+  const chosen = settings.characters?.length ? all.filter((c) => settings.characters.includes(c.id)) : all;
+  const coloured = chosen.length <= CHARACTER_COLORS.length ? chosen
+    : chosen.filter((c) => [...chosen].sort((a, b) => b.total - a.total).slice(0, CHARACTER_COLORS.length - 1).includes(c));
+  const colourOf = (c, i) => CHARACTER_COLORS[all.length <= CHARACTER_COLORS.length ? all.indexOf(c) : i];
+  const groups = coloured.map((c, i) => ({ id: c.id, name: c.name, ids: [c.id], color: colourOf(c, i) }));
+  const rest = chosen.filter((c) => !coloured.includes(c));
+  if (rest.length) groups.push({ id: "other", name: `${rest.length} other characters`, ids: rest.map((c) => c.id), color: C.neutralStrong });
+  return groups;
+}
+
+// The rows, total and parts the chart shows, for everyone or per group.
+function breakdownView(kind, d, settings) {
+  const groups = breakdownGroups(d, settings), config = BREAKDOWNS[kind];
+  if (!groups) {
+    const rows = d.rows.map((row) => ({ ...row, segments: (row.parts ?? [{ value: row.value }])
+      .map((part, k) => ({ value: part.value, label: part.label, color: k === 0 ? config.color : config.partColor })) }));
+    return { groups, rows, total: d.total, parts: d.parts };
+  }
+  const sumOf = (ids, pick) => ids.reduce((sum, id) => sum + (pick(id) || 0), 0);
+  const rows = d.rows.map((row) => {
+    const segments = groups.map((g) => ({ value: sumOf(g.ids, (id) => row.by_character?.[id]), label: g.name, color: g.color }));
+    return { ...row, segments, value: segments.reduce((sum, seg) => sum + seg.value, 0) };
+  }).sort((a, b) => b.value - a.value); // Stable, so equal rows keep the usual order.
+  const ids = groups.flatMap((g) => g.ids);
+  const parts = Object.fromEntries(Object.keys(d.parts).map((key) => [key, sumOf(ids, (id) => d.parts_by_character?.[id]?.[key])]));
+  groups.forEach((g) => { g.total = rows.reduce((sum, row) => sum + row.segments[groups.indexOf(g)].value, 0); });
+  return { groups, rows, total: rows.reduce((sum, row) => sum + row.value, 0), parts };
+}
+
+// One labelled bar per cost or source of revenue, largest first, growing in turn. All
+// together, auction house costs stack their two parts; split by character, every bar
+// stacks the chosen characters. Either way the colours are keyed beside the bars.
+function breakdownFigure(kind, data, ctx, options) {
   const L = layoutFor(options), s = L.s;
-  const d = data.costs, p = d.parts;
-  const head = header(L, ctx, CHARTS.costs, subtitleFor(ctx, d.start, d.end));
-  const big = hero(L, head.bottom, { copper: d.total }, null, 0.85);
-  const { plot, side } = regions(L, big.bottom + 6 * s, { tallPlotShare: 0.6 });
+  const d = data[kind], config = BREAKDOWNS[kind];
+  const view = breakdownView(kind, d, options.axis), { groups, rows, parts: p } = view;
+  const head = header(L, ctx, CHARTS[kind], subtitleFor(ctx, d.start, d.end));
+  const big = hero(L, head.bottom, { copper: view.total }, null, 0.85);
+  const { plot, side } = regions(L, big.bottom + 6 * s, { tallPlotShare: groups ? 0.5 : 0.6 });
   const axis = { start: 0, ignored: false };
   let out = "", anim = null, hover = null;
-  if (!d.has_activity) {
-    out += emptyMessage(plot, "No costs recorded in this window", s);
+  if (!d.has_activity || !view.total) {
+    out += emptyMessage(plot, d.has_activity ? config.noneChosen : config.empty, s);
   } else {
-    const rowH = plot.h / d.rows.length;
-    const size = Math.min(15 * s, rowH * 0.3), barH = Math.min(16 * s, rowH * 0.3), radius = 3 * s;
-    const max = Math.max(1, ...d.rows.map((row) => row.value));
+    const rowH = plot.h / rows.length;
+    const size = Math.min(15 * s, rowH * 0.3), barH = Math.min(16 * s, rowH * 0.3), radius = 3 * s, gap = 2 * s;
+    const max = Math.max(1, ...rows.map((row) => row.value));
     const bars = [], hits = [];
-    d.rows.forEach((row, i) => {
+    rows.forEach((row, i) => {
       const y = plot.y + rowH * i, baseline = y + size, barY = baseline + 8 * s;
-      const from = 0.08 + (0.6 * i) / Math.max(1, d.rows.length - 1), to = Math.min(1, from + 0.3);
+      const from = 0.08 + (0.6 * i) / Math.max(1, rows.length - 1), to = Math.min(1, from + 0.3);
       out += text(plot.x, baseline, row.label, { size, fill: C.text2 });
       out += reveal((to - 0.02).toFixed(3), run(plot.x + plot.w, baseline, [{ copper: row.value }], { size, weight: 600, anchor: "end" }));
       out += `<rect x="${plot.x}" y="${barY}" width="${plot.w}" height="${barH}" rx="${radius}" fill="${C.grid}"/>`;
-      const segments = (row.parts ?? [{ value: row.value }])
-        .map((part, k) => ({ value: part.value, color: k === 0 ? C.spent : C.spentLight }))
-        .filter((segment) => segment.value > 0);
+      const segments = row.segments.filter((segment) => segment.value > 0);
       // A tiny cost still shows as a sliver.
       const full = row.value > 0 ? Math.max(2 * s, (plot.w * row.value) / max) : 0;
       let x = plot.x, at = from;
       segments.forEach((segment, k) => {
+        const last = k === segments.length - 1;
         const width = (full * segment.value) / row.value, until = at + ((to - from) * segment.value) / row.value;
-        const r = k === segments.length - 1 ? radius : 0;
-        out += `<path data-hbar="${bars.length}" d="${rowPath(x, barY, width, barH, r)}" fill="${segment.color}"/>`;
-        bars.push({ x, y: barY, width, height: barH, radius: r, from: at, to: until });
+        // A thin gap of background between stacked pieces keeps neighbours apart.
+        const drawn = last ? width : Math.max(Math.min(width, 1 * s), width - gap);
+        const r = last ? radius : 0;
+        out += `<path data-hbar="${bars.length}" d="${rowPath(x, barY, drawn, barH, r)}" fill="${segment.color}"/>`;
+        bars.push({ x, y: barY, width: drawn, height: barH, radius: r, from: at, to: until });
         x += width;
         at = until;
       });
-      const tip = row.parts
-        ? [{ copper: row.value, label: "in all" }, ...row.parts.map((part, k) => ({ copper: part.value, label: part.label, color: k === 0 ? C.spent : C.spentLight }))]
-        : [{ copper: row.value, label: countText(row.key, row.count) }];
+      const tip = groups || row.parts
+        ? [{ copper: row.value, label: "in all" }, ...row.segments.filter((seg) => seg.value).map((seg) => ({ copper: seg.value, label: seg.label, color: seg.color }))]
+        : [{ copper: row.value, label: countText(kind, row.key, row.count) }];
       hits.push({ x: plot.x, y, w: plot.w, h: rowH, title: row.label, copper: row.value, rows: tip });
     });
     anim = { kind: "hbars", bars };
     hover = { kind: "bars", hits, s };
   }
-  const plain = (rows) => rows.map((row) => ({ ...row, signed: false }));
-  const sections = [
-    { heading: "Auction house costs", rows: plain([
-      { label: "Unsold listing fees", copper: p.listing_fees, swatch: C.spent },
-      { label: "Auction house cut", copper: p.ah_cut, swatch: C.spentLight },
-    ]) },
-    { heading: "Auction house purchases", rows: plain([
-      { label: "Bought", copper: p.bought },
-      ...(p.bid_refunds ? [{ label: "Bids sent back", copper: -p.bid_refunds }] : []),
-    ]) },
-    { rows: plain([{ label: "Total costs", copper: d.total, strong: true }]) },
-  ];
+  const total = { rows: plain([{ label: config.totalLabel, copper: view.total, strong: true }]) };
+  // A Short has little room below the bars, so a long character list replaces the detail.
+  const sections = groups
+    ? [{ heading: "Characters", rows: plain(groups.map((g) => ({ label: g.name, copper: g.total, swatch: g.color }))) },
+      ...(L.tall && groups.length > 4 ? [] : config.side(p, groups)), total]
+    : [...config.side(p, null), total];
   out += sideList(side, sections, s, 0.45, 0.95);
   return { svg: shell(L, head.svg + big.svg + out), hover, anim, axis };
 }
@@ -697,8 +777,9 @@ function itemFigure(data, ctx, options) {
   return { svg: shell(L, head.svg + out), hover: { kind: "bars", hits, s }, anim: { kind: "hbars", bars }, axis: { start: 0, ignored: false } };
 }
 
-const BUILDERS = { start: startFigure, auction: auctionFigure, value: valueFigure, costs: costFigure, item: itemFigure };
-const SCREEN = { start: { width: 1200, height: 500 }, auction: { width: 1200, height: 500 }, value: { width: 1200, height: 460 }, costs: { width: 1200, height: 500 }, item: { width: 1200, height: 500 } };
+const BUILDERS = { start: startFigure, auction: auctionFigure, value: valueFigure, item: itemFigure,
+  costs: (...args) => breakdownFigure("costs", ...args), revenue: (...args) => breakdownFigure("revenue", ...args) };
+const SCREEN = { start: { width: 1200, height: 500 }, auction: { width: 1200, height: 500 }, value: { width: 1200, height: 460 }, costs: { width: 1200, height: 500 }, revenue: { width: 1200, height: 500 }, item: { width: 1200, height: 500 } };
 const EXPORT_SIZES = { short: { width: 1080, height: 1920, tall: true, scale: 2.1 }, long: { width: 1920, height: 1080, tall: false, scale: 1.6 } };
 
 // `tall` shows the vertical layout on screen, exactly as a Short's image has it.
@@ -979,7 +1060,7 @@ export function attachHover(svgElement, hover, tooltip) {
 
 // The same numbers as each chart, readable without hovering. A cell is text,
 // {copper, signed} or {text, icon}.
-export function tableFor(kind, data) {
+export function tableFor(kind, data, settings) {
   const money = (copper, signed = false) => ({ copper, signed });
   if (kind === "start") {
     const d = data.start;
@@ -994,17 +1075,32 @@ export function tableFor(kind, data) {
     return { columns: ["Item", "Quantity sold", "Sold", "Spent", "Net"], numeric: [1, 2, 3, 4],
       rows: d.top.map((r) => [{ text: r.name, icon: r.icon }, number.format(r.quantity), money(r.sold), money(r.spent), money(r.net, true)]) };
   }
-  if (kind === "costs") {
-    const d = data.costs, p = d.parts;
-    const detail = { ah_fees: [["Unsold listing fees", p.listing_fees], ["Auction house cut", p.ah_cut]],
-      ah_purchases: p.bid_refunds ? [["Bought", p.bought], ["Bids sent back", -p.bid_refunds]] : [] };
-    return { columns: ["Cost", "Amount", "How many"], numeric: [1, 2], rows: [
+  if (kind in BREAKDOWNS) {
+    const d = data[kind], config = BREAKDOWNS[kind], view = breakdownView(kind, d, settings), { groups } = view;
+    const indent = (label) => `   ${label}`;
+    // The parts under a row, for the parts it has and only when they say something.
+    const details = (r, parts) => (config.details[r.key] ?? []).filter((detail) => !detail.when || detail.when(parts));
+    // A part that adds to or takes from its row shows its sign.
+    const signed = (detail, copper) => money((detail.sign ?? 1) * copper, detail.sign !== undefined);
+    if (groups) {
+      // One column per character group, as the bars are stacked.
+      const partOf = (g, key) => g.ids.reduce((sum, id) => sum + (d.parts_by_character?.[id]?.[key] || 0), 0);
+      return { columns: [config.column, ...groups.map((g) => g.name), "Total"], numeric: groups.map((_, i) => i + 1).concat(groups.length + 1), rows: [
+        ...view.rows.flatMap((r) => [
+          [r.label, ...r.segments.map((seg) => money(seg.value)), money(r.value)],
+          ...details(r, view.parts).map((detail) =>
+            [indent(detail.label), ...groups.map((g) => signed(detail, partOf(g, detail.key))), signed(detail, view.parts[detail.key])]),
+        ]),
+        [config.totalLabel, ...groups.map((g) => money(g.total)), money(view.total)],
+      ] };
+    }
+    return { columns: [config.column, "Amount", "How many"], numeric: [1, 2], rows: [
       ...d.rows.flatMap((r) => [
-        [r.label, money(r.value), r.count ? countText(r.key, r.count) : ""],
-        ...(detail[r.key] ?? []).map(([label, copper]) => [`   ${label}`, money(copper), ""]),
+        [r.label, money(r.value), r.count ? countText(kind, r.key, r.count) : ""],
+        ...details(r, d.parts).map((detail) => [indent(detail.label), signed(detail, d.parts[detail.key]), ""]),
       ]),
       ...(d.unpriced_returns ? [["Returned listings with no deposit on record", "", number.format(d.unpriced_returns)]] : []),
-      ["Total costs", money(d.total), ""],
+      [config.totalLabel, money(d.total), ""],
     ] };
   }
   if (kind === "item") {

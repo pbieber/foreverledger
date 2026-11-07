@@ -113,7 +113,7 @@ class IconStore:
         (self.folder / target).write_bytes(data)
         return target
 
-    def _find(self, name, item_id, source, deadline):
+    def _find(self, name, item_id, source, deadline, icon_name=None):
         key = name.casefold()
         entry = self.index.get(key, {})
         if entry.get("file"):
@@ -124,10 +124,10 @@ class IconStore:
         if not filename:
             now = time.time()
             if (not self.online or now < self.offline_until or now > deadline or
-                    entry.get("missing_until", 0) > now):
+                    (entry.get("missing_until", 0) > now and not icon_name)):
                 return None
             try:
-                icon = self._icon_name_online(name, item_id, source)
+                icon = icon_name or self._icon_name_online(name, item_id, source)
                 filename = self._file_for_icon(icon) if isinstance(icon, str) else None
             except OSError:  # Includes every network failure: try again in a few minutes.
                 self.offline_until = time.time() + OFFLINE_RETRY
@@ -139,8 +139,11 @@ class IconStore:
         return self._as_data_uri(filename) if filename else None
 
     def attach(self, rows, source):
-        """Give each row an `icon` data URI, or None. Takes a few seconds at most."""
+        """Give each row an `icon` data URI, or None. Takes a few seconds at most.
+
+        A row that already knows Wowhead's name for its icon (`icon_name`) skips looking it up.
+        """
         deadline = time.time() + self.budget
         with self.lock:
             for row in rows:
-                row["icon"] = self._find(row["name"], row.get("item_id"), source, deadline)
+                row["icon"] = self._find(row["name"], row.get("item_id"), source, deadline, row.pop("icon_name", None))

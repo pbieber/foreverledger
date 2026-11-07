@@ -11,7 +11,7 @@ from pathlib import Path
 FORMATS = ("short", "long")
 STATUSES = ("idea", "scripting", "recording", "editing", "published")
 SOURCES = ("forever", "tbc", "mock")
-CHARTS = ("", "start", "auction", "value", "costs", "item")
+CHARTS = ("", "start", "auction", "value", "costs", "revenue", "item")
 RANGES = ("window", "to_date")
 AXIS_MODES = ("zero", "fit", "custom")
 
@@ -50,6 +50,9 @@ def connect(path):
     if "chart_settings" not in columns:
         with db:
             db.execute("ALTER TABLE episodes ADD COLUMN chart_settings TEXT NOT NULL DEFAULT '{}'")
+    if "visuals" not in columns:
+        with db:
+            db.execute("ALTER TABLE episodes ADD COLUMN visuals TEXT NOT NULL DEFAULT '[]'")
     return db
 
 
@@ -91,12 +94,58 @@ def _chart_settings(value):
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0.5 <= seconds <= 60:
             raise Invalid("Animation length must be between 0.5 and 60 seconds")
         entry["seconds"] = seconds
+        if chart in ("costs", "revenue"):
+            # All characters together, or the chosen ones (none chosen means all) each in its colour.
+            split, chosen = settings.get("split", False), settings.get("characters", [])
+            if not isinstance(split, bool):
+                raise Invalid("The character split is not valid")
+            if (not isinstance(chosen, list) or len(chosen) > 200
+                    or not all(isinstance(c, str) and 0 < len(c) <= 100 for c in chosen)):
+                raise Invalid("The chosen characters are not valid")
+            entry["split"], entry["characters"] = split, list(dict.fromkeys(chosen))
         if chart == "item" and "name" in settings:
             name = settings["name"]
             if not isinstance(name, str) or len(name) > 200:
                 raise Invalid("The item name is not valid")
             entry["name"] = name
         clean[chart] = entry
+    return json.dumps(clean)
+
+
+MAX_VISUALS = 100
+PLACES = ("right", "below")
+MAX_COPPER = 10 ** 15
+
+
+def _visuals(value):
+    """Item cards for the video: an item, a gold amount that can be a gain or a loss, and
+    which optional tooltip lines it shows."""
+    if not isinstance(value, list) or len(value) > MAX_VISUALS:
+        raise Invalid(f"Visuals must be a list of at most {MAX_VISUALS}")
+    clean = []
+    for visual in value:
+        if not isinstance(visual, dict):
+            raise Invalid("A visual is not valid")
+        key, item_id, name = visual.get("key"), visual.get("item_id"), visual.get("name")
+        copper = visual.get("copper", 0)
+        if not isinstance(key, str) or not 0 < len(key) <= 40:
+            raise Invalid("A visual needs a key")
+        if isinstance(item_id, bool) or not isinstance(item_id, int) or not 0 < item_id < 10 ** 9:
+            raise Invalid("A visual needs an item ID")
+        if not isinstance(name, str) or len(name) > 200:
+            raise Invalid("The item name is not valid")
+        if isinstance(copper, bool) or not isinstance(copper, int) or abs(copper) >= MAX_COPPER:
+            raise Invalid("The gold amount is not valid")
+        entry = {"key": key, "item_id": item_id, "name": name, "copper": copper,
+                 "place": _choice(visual.get("place", "right"), PLACES, "Where the amount goes")}
+        for flag in ("sell", "ilvl"):
+            shown = visual.get(flag, True)
+            if not isinstance(shown, bool):
+                raise Invalid("A tooltip line choice is not valid")
+            entry[flag] = shown
+        clean.append(entry)
+    if len({v["key"] for v in clean}) != len(clean):
+        raise Invalid("Each visual needs its own key")
     return json.dumps(clean)
 
 
@@ -150,7 +199,7 @@ def get_episode(db, episode_id):
     if not row:
         raise NotFound("Episode not found")
     shots = db.execute("SELECT * FROM shots WHERE episode_id=? ORDER BY position,id", (episode_id,)).fetchall()
-    return dict(row, chart_settings=json.loads(row["chart_settings"]),
+    return dict(row, chart_settings=json.loads(row["chart_settings"]), visuals=json.loads(row["visuals"]),
                 shots=[dict(s, done=bool(s["done"])) for s in shots])
 
 
@@ -163,6 +212,7 @@ def update_episode(db, episode_id, fields):
         "window": lambda v: _text(v, "Window"),
         "range": lambda v: _choice(v, RANGES, "Range"),
         "chart_settings": _chart_settings,
+        "visuals": _visuals,
     }
     unknown = set(fields) - set(cleaners)
     if unknown:

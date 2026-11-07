@@ -1,6 +1,7 @@
 local _,F=...
 local PREFIX="FLedger"
-local PROTOCOL=1
+-- 2: long messages carry their length and checksum.
+local PROTOCOL=2
 -- Told in every hello, so a copy without a feature is never asked for it.
 local FEATURES=2
 -- An addon message carries 255 bytes, and one of them is the part marker.
@@ -179,13 +180,34 @@ function F.SyncSummary(lines,total)
     lines[#lines+1]="All accounts total: "..F.Money(total)
 end
 
+local function checksum(text)
+    local a,b=1,0
+    for i=1,#text do
+        a=(a+text:byte(i))%65521
+        b=(b+a)%65521
+    end
+    return b*65536+a
+end
+
+-- A long message starts with its length and checksum. The client can lose a part
+-- under load, and the parts either side of it can still join into valid JSON.
+local function frame(text)
+    return #text..":"..checksum(text)..":"..text
+end
+
+local function unframe(text)
+    local size,sum,body=text:match("^(%d+):(%d+):(.*)$")
+    if body and tonumber(size)==#body and tonumber(sum)==checksum(body) then return body end
+end
+
 local function whisper(target,payload,ping)
     local text=F.JSON(payload)
-    local size=#text
-    if size<=PART_SIZE then
+    if #text<=PART_SIZE then
         queue[#queue+1]={target=target,text="S"..text,ping=ping}
         return
     end
+    text=frame(text)
+    local size=#text
     for first=1,size,PART_SIZE do
         local marker=first==1 and "F" or first+PART_SIZE>size and "L" or "M"
         queue[#queue+1]={target=target,text=marker..text:sub(first,first+PART_SIZE-1),ping=ping}
@@ -204,15 +226,6 @@ local function toPeer(source,target,payload,ping)
     payload.s=F.db.sourceID
     payload.k=F.db.peers[source].key
     whisper(target,payload,ping)
-end
-
-local function checksum(text)
-    local a,b=1,0
-    for i=1,#text do
-        a=(a+text:byte(i))%65521
-        b=(b+a)%65521
-    end
-    return b*65536+a
 end
 
 local function localIndex()
@@ -339,6 +352,15 @@ local function createPeer(source,name,key,label)
     own(name)
     F.Emit("sync_linked",{sourceID=source,name=name})
     return p
+end
+
+-- History synced before messages were checked can have rows missing, repeated or
+-- spliced together. Fetch it again once; everything else is replaced on each sync.
+function F.RepairPeerHistory()
+    if F.db.peerHistoryRefetched then return end
+    F.db.peerHistoryRefetched=true
+    for _,p in pairs(F.db.peers) do p.history={} end
+    merged=nil
 end
 
 local function applyTotal(p,st,total)
@@ -617,7 +639,8 @@ local function reassemble(sender,text)
     buffer.parts[#buffer.parts+1]=body
     if marker=="L" then
         buffers[sender]=nil
-        return table.concat(buffer.parts)
+        -- A message that lost a part is dropped; the request for it is retried.
+        return unframe(table.concat(buffer.parts))
     end
 end
 

@@ -255,6 +255,63 @@ class AddonTests(unittest.TestCase):
         self.assertEqual(len(self.kind("auction_outcome")),1)
         self.assertEqual(self.kind("auction_return")[0]["auctionKey"],"Player-Main:55")
 
+    # Forever fires AUCTION_CANCELED when an auction sells or expires, not only on a cancel.
+    def sell_mail(self):
+        self.run_lua('F.Invoice({invoiceType="seller",item={id=2770,name="Copper Ore"},quantity=1,gross=100000,'
+                     'commission=5000,depositRefund=5000,money=100000})')
+
+    def test_auction_canceled_without_a_cancel_is_not_a_cancellation(self):
+        self.post()
+        self.run_lua('NOW=NOW+60; F.events.AUCTION_CANCELED(55); NOW=NOW+3600')
+        self.assertEqual(self.kind("auction_outcome"),[])
+        self.assertEqual(self.kind("auction_left")[0]["auctionKey"],"Player-Main:55")
+        self.sell_mail()
+        outcome=self.kind("auction_outcome")
+        self.assertEqual([o["outcome"] for o in outcome],["sold"])
+        self.assertNotIn("depositLost",outcome[0])
+        self.assertEqual(outcome[0]["leftAt"],1800000060)  # When it sold, not when the mail came.
+
+    def test_players_own_cancel_is_a_cancellation(self):
+        self.post()
+        self.run_lua('''
+        C_AuctionHouse.CancelAuction=function() end; C_AuctionHouse.GetCancelCost=function() return 0 end
+        F.InstallHooks(); C_AuctionHouse.CancelAuction(55); CLOCK=1; F.events.AUCTION_CANCELED(55)
+        ''')
+        outcome=self.kind("auction_outcome")
+        self.assertEqual([(o["outcome"],o["confidence"],o["depositLost"]) for o in outcome],[("cancelled","player_cancel",5000)])
+        self.assertEqual(self.kind("auction_left"),[])
+
+    def test_an_old_cancel_only_counts_if_the_event_follows_the_call(self):
+        self.post()
+        self.run_lua('''
+        C_AuctionHouse.CancelAuction=function() end; C_AuctionHouse.GetCancelCost=function() return 0 end
+        F.InstallHooks(); C_AuctionHouse.CancelAuction(55); CLOCK=600; F.events.AUCTION_CANCELED(55)
+        ''')
+        self.assertEqual(self.kind("auction_outcome"),[])
+
+    def test_a_later_sale_overrides_a_cancel(self):
+        self.post()
+        self.run_lua('F.AuctionOutcome(F.AuctionKey(55),"cancelled","server_id")')  # As earlier versions recorded it.
+        self.sell_mail()
+        outcome=self.kind("auction_outcome")
+        self.assertEqual([o["outcome"] for o in outcome],["cancelled","sold"])
+        self.assertEqual(outcome[1]["replaces"],"cancelled")
+        self.assertEqual(self.kind("auction_sale")[0]["auctionKey"],"Player-Main:55")
+        self.assertEqual(self.run_lua('return F.db.auctions["Player-Main:55"].outcome'),"sold")
+        self.sell_mail()  # The same auction cannot sell twice.
+        self.assertEqual(self.kind("auction_sale")[1]["matchConfidence"],"unmatched")
+
+    def test_a_sale_does_not_override_a_cancel_without_mail(self):
+        self.post()
+        self.run_lua('F.AuctionOutcome(F.AuctionKey(55),"cancelled","server_id"); F.AuctionOutcome(F.AuctionKey(55),"sold","x")')
+        self.assertEqual([o["outcome"] for o in self.kind("auction_outcome")],["cancelled"])
+
+    def test_mail_goes_to_the_auction_that_left_the_house(self):
+        self.post(); self.post(56)
+        self.run_lua('NOW=NOW+10; F.events.AUCTION_CANCELED(56)')
+        self.run_lua('F.Invoice({failure="expired",item={id=2770,name="Copper Ore"},quantity=1})')
+        self.assertEqual([(o["auctionKey"],o["outcome"]) for o in self.kind("auction_outcome")],[("Player-Main:56","expired")])
+
     def test_offline_failure_fifo_is_explicit(self):
         self.post(); self.post(56)
         self.run_lua('F.Invoice({failure="expired",item={id=2770},quantity=1})')

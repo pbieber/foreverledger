@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime
 import json
 import re
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 
 import ledger
 
@@ -32,6 +32,11 @@ COST_ROWS = (("class_training", "Class training"), ("profession_training", "Prof
              ("repair", "Repairs"), ("flight", "Flights"), ("ah_fees", "Auction house costs"),
              ("ah_purchases", "Auction house purchases"))
 AH_BOUGHT = {"auction_purchase", "auction_purchase_or_bid"}
+COST_PARTS = ("listing_fees", "ah_cut", "bought", "bid_refunds")
+REVENUE_ROWS = (("ah_sales", "Auction house sales"), ("loot", "Looted gold"), ("quest", "Quest rewards"),
+                ("vendor_sale", "Vendor sales"), ("players", "From other players"))
+REVENUE_PARTS = ("sold_for", "ah_cut", "deposits_back", "collected")
+PLAYER_CATEGORIES = {"trade", "mail_received", "mail_cod"}
 # Ranks and recipe families that no class spell is named like.
 PROFESSION_PREFIXES = ("Apprentice ", "Journeyman ", "Expert ", "Artisan ", "Master ", "Grand Master ", "Enchant ",
                        "Elixir of ", "Flask of ", "Transmute", "Smelt ")
@@ -68,8 +73,12 @@ def _day_bounds(timestamp):
 def marker_intervals(db):
     """Each marker's stretches of time, per account, in order.
 
-    A marker runs until its end, the account's next marker, or the account's last
-    record. Both accounts can use one label, so a name can hold several intervals.
+    A marker runs until its end, the next marker started on any account, or the
+    account's last record. Both accounts can use one label, so a name can hold several
+    intervals, and starting that same label on the other account leaves it running.
+    A new label on one account also moves every account still in an older marker onto
+    it, so a marker forgotten on one account doesn't stretch the old window over the
+    new one. An account whose marker has ended stays outside the new one.
     """
     latest = dict(db.execute("SELECT source_id,MAX(time) FROM events GROUP BY source_id").fetchall())
     intervals, open_marker = {}, {}
@@ -84,7 +93,11 @@ def marker_intervals(db):
         if source in open_marker:
             close(source, moment)
         if kind == "episode_start":
-            open_marker[source] = (json.loads(data).get("name") or "Unnamed marker", moment)
+            name = json.loads(data).get("name") or "Unnamed marker"
+            for other in [s for s, (open_name, _) in open_marker.items() if open_name != name]:
+                close(other, moment)
+                open_marker[other] = (name, moment)
+            open_marker[source] = (name, moment)
     for source in list(open_marker):
         close(source, latest[source])
     return intervals
@@ -364,29 +377,79 @@ def _training_kinds(trainings, item_names):
     return kinds
 
 
+def _deposits_not_lost(db, activities):
+    """How much of each auction's lost deposit a sale gave back, by auctionKey, and the
+    auctions whose last outcome is a sale.
+
+    Earlier addon versions read Forever's AUCTION_CANCELED, which fires when an auction
+    sells or expires, as a cancel. The auction stayed "cancelled" and the sale mail that
+    followed matched nothing. So a sale's deposit refund goes back to its own auction or,
+    unmatched, to the same character's auctions of that item and unit price whose deposit
+    was marked lost, most recently left first. A partly sold commodity keeps the rest.
+    """
+    posted = {}
+    for data, in db.execute("SELECT data FROM events WHERE kind='auction_posted'"):
+        d = json.loads(data)
+        posted[d.get("key")] = d
+    lost, final = {}, {}
+    for moment, data in db.execute("SELECT time,data FROM events WHERE kind='auction_outcome' ORDER BY time"):
+        d = json.loads(data)
+        final[d.get("auctionKey")] = d.get("outcome")
+        if d.get("depositLost"):
+            lost[d.get("auctionKey")] = (d.get("leftAt") or moment, d["depositLost"])
+    keys = {}
+    for event_id, data in db.execute("SELECT id,data FROM events WHERE kind='auction_sale'"):
+        keys[event_id] = json.loads(data).get("auctionKey")
+
+    refunded = defaultdict(int)
+    for moment, d, character in activities:
+        refund = d.get("depositRefund") or 0
+        if d.get("category") != "auction_sale" or (d.get("amount") or 0) <= 0 or refund <= 0:
+            continue
+        key = keys.get(d.get("saleID"))
+        if key:
+            candidates = [key] if key in lost else []
+        else:
+            name, quantity, gross = (d.get("item") or {}).get("name"), d.get("quantity"), d.get("gross")
+            candidates = [k for k, a in posted.items() if k in lost and a.get("character") == character
+                          and (a.get("item") or {}).get("name") == name and lost[k][0] <= moment
+                          and quantity and gross is not None and a.get("quantity") and a.get("totalPrice") is not None
+                          and gross * a["quantity"] == a["totalPrice"] * quantity]
+            candidates.sort(key=lambda k: -lost[k][0])
+        for k in candidates:
+            take = min(refund, lost[k][1] - refunded[k])
+            if take > 0:
+                refunded[k] += take
+                refund -= take
+    sold = {k for k, outcome in final.items() if outcome == "sold"}
+    return refunded, sold
+
+
 def _lost_listing_fees(db, activities):
     """Each deposit kept by the auction house because a listing came back unsold.
 
-    Returns (time, copper) per loss, with copper None when the deposit is not on
-    record. A server-identified outcome carries its deposit. Otherwise, as on the
-    old auction house, a returned listing takes the earliest earlier deposit for the
-    same item and quantity that no sale has already claimed back.
+    Returns (time, copper, character) per loss, with copper None when the deposit is
+    not on record. A server-identified outcome carries its deposit, less what a sale of
+    that auction gave back (see `_deposits_not_lost`). Otherwise, as on
+    the old auction house, a returned listing takes the same character's earliest
+    earlier deposit for the same item and quantity that no sale has claimed back.
     """
     timeline = []
-    for moment, d, _ in activities:
+    for moment, d, character in activities:
         category = d.get("category")
         if category == "auction_deposit" and not d.get("auctionKey"):
-            timeline.append((moment, 0, "deposit", d))
+            timeline.append((moment, 0, "deposit", d, character))
         elif category == "auction_sale":
-            timeline.append((moment, 1, "sale", d))
-    for moment, kind, data in db.execute(
-            "SELECT time,kind,data FROM events WHERE kind IN ('auction_outcome','auction_return')"):
-        timeline.append((moment, 1, kind, json.loads(data)))
+            timeline.append((moment, 1, "sale", d, character))
+    for moment, kind, data, character in db.execute(
+            "SELECT time,kind,data,character FROM events WHERE kind IN ('auction_outcome','auction_return')"):
+        timeline.append((moment, 1, kind, json.loads(data), character))
     timeline.sort(key=lambda row: (row[0], row[1]))
 
+    refunded, sold = _deposits_not_lost(db, activities)
     unsold, losses = {}, []
-    for moment, _, kind, d in timeline:
-        key = ((d.get("item") or {}).get("name"), d.get("quantity"))
+    for moment, _, kind, d, character in timeline:
+        key = (character, (d.get("item") or {}).get("name"), d.get("quantity"))
         deposits = unsold.setdefault(key, deque())
         if kind == "deposit":
             deposits.append(-(d.get("amount") or 0))
@@ -398,10 +461,12 @@ def _lost_listing_fees(db, activities):
                 else:
                     deposits.popleft()
         elif kind == "auction_outcome":
-            if d.get("depositLost"):
-                losses.append((moment, d["depositLost"]))
+            key = d.get("auctionKey")
+            if d.get("depositLost") and key not in sold and d["depositLost"] > refunded[key]:
+                losses.append((moment, d["depositLost"] - refunded[key], character))
+                refunded[key] = d["depositLost"]  # An auction loses its deposit once.
         elif not d.get("auctionKey"):
-            losses.append((moment, deposits.popleft() if deposits else None))
+            losses.append((moment, deposits.popleft() if deposits else None, character))
     return losses
 
 
@@ -415,52 +480,135 @@ def cost_figure(db, window):
     start, end = window["start"], window["end"]
     activities = _activities(db)
     inside = [row for row in activities if start <= row[0] <= end]
-    totals = {key: 0 for key, _ in COST_ROWS}
-    counts = {key: 0 for key, _ in COST_ROWS}
-    parts = {"listing_fees": 0, "ah_cut": 0, "bought": 0, "bid_refunds": 0}
+    tally = _Tally(COST_ROWS, COST_PARTS)
+    book, piece, counts, pieces = tally.book, tally.piece, tally.counts, tally.pieces
 
     trainings = [row for row in inside if row[1].get("category") == "training"]
     kinds = _training_kinds(trainings, lambda: _item_names(db))
-    for _, d, _ in inside:
+    for _, d, character in inside:
         category, amount = d.get("category"), d.get("amount") or 0
         if category == "training":
             key = f"{kinds[id(d)]}_training"
-            totals[key] -= amount
+            book(character, key, -amount)
             counts[key] += 1
         elif category in ("repair", "flight"):
-            totals[category] -= amount
+            book(character, category, -amount)
             counts[category] += 1
         elif category in AH_BOUGHT:
-            parts["bought"] -= amount
+            piece(character, "bought", -amount)
             counts["ah_purchases"] += 1
         elif category == "auction_cancel_fee":
-            parts["listing_fees"] -= amount
+            piece(character, "listing_fees", -amount)
             counts["ah_fees"] += 1
-        elif category == "auction_sale" and d.get("commission"):
-            parts["ah_cut"] += d["commission"]
+        elif category == "auction_sale" and d.get("commission") and amount > 0:
+            # A sale mail read again without its money taken is not another sale.
+            piece(character, "ah_cut", d["commission"])
         elif category == "mail_received" and amount > 0 and "Auction House" in (d.get("sender") or ""):
-            parts["bid_refunds"] += amount
+            piece(character, "bid_refunds", amount)
 
     unpriced = 0
-    for moment, copper in _lost_listing_fees(db, activities):
+    for moment, copper, character in _lost_listing_fees(db, activities):
         if start <= moment <= end:
             if copper is None:
                 unpriced += 1
             else:
-                parts["listing_fees"] += copper
+                piece(character, "listing_fees", copper)
                 counts["ah_fees"] += 1
-    totals["ah_fees"] = parts["listing_fees"] + parts["ah_cut"]
-    totals["ah_purchases"] = parts["bought"] - parts["bid_refunds"]
+    for character, p in pieces.items():
+        book(character, "ah_fees", p["listing_fees"] + p["ah_cut"])
+        book(character, "ah_purchases", p["bought"] - p["bid_refunds"])
 
-    order = {key: i for i, (key, _) in enumerate(COST_ROWS)}
-    rows = [{"key": key, "label": label, "value": totals[key], "count": counts[key]} for key, label in COST_ROWS]
-    rows.sort(key=lambda row: (-row["value"], order[row["key"]]))
-    for row in rows:
+    result = tally.result(db, window)
+    parts = result["parts"]
+    for row in result["rows"]:
         if row["key"] == "ah_fees":
             row["parts"] = [{"label": "Unsold listing fees", "value": parts["listing_fees"]},
                             {"label": "Auction house cut", "value": parts["ah_cut"]}]
-    return {"start": start, "end": end, "total": sum(totals.values()), "rows": rows, "parts": parts,
-            "unpriced_returns": unpriced, "has_activity": any(totals.values())}
+    return dict(result, unpriced_returns=unpriced)
+
+
+def revenue_figure(db, window):
+    """What came in during a window, from five kinds of revenue, largest first.
+
+    Auction house sales count at the price the buyer paid, so that, with the house's
+    cut counted as a cost, revenue less costs is what was really made. A returned
+    deposit was never a cost, so it is not revenue either. Gold from your own
+    characters, and bids the auction house sends back, are not revenue.
+    """
+    start, end = window["start"], window["end"]
+    owners = _owners(db)
+    tally = _Tally(REVENUE_ROWS, REVENUE_PARTS)
+    for moment, d, character in _activities(db):
+        category, amount = d.get("category"), d.get("amount") or 0
+        if not start <= moment <= end or amount <= 0:
+            continue
+        if category == "auction_sale":
+            cut, back = d.get("commission") or 0, d.get("depositRefund") or 0
+            sold_for = d.get("gross") or amount + cut - back
+            tally.book(character, "ah_sales", sold_for)
+            tally.counts["ah_sales"] += 1
+            for key, copper in (("sold_for", sold_for), ("ah_cut", cut), ("deposits_back", back), ("collected", amount)):
+                tally.piece(character, key, copper)
+        elif category in ("loot", "quest", "vendor_sale"):
+            tally.book(character, category, amount)
+            tally.counts[category] += 1
+        elif (category in PLAYER_CATEGORIES and not _is_internal(d, owners)
+              and "Auction House" not in (d.get("sender") or "")):
+            tally.book(character, "players", amount)
+            tally.counts["players"] += 1
+    return tally.result(db, window)
+
+
+class _Tally:
+    """Copper per character for each row of a breakdown, plus per-character parts that
+    explain a row, and how many records each row came from."""
+
+    def __init__(self, row_defs, part_keys):
+        self.row_defs, self.part_keys = row_defs, part_keys
+        self.amounts, self.pieces = {}, {}
+        self.counts = {key: 0 for key, _ in row_defs}
+
+    def book(self, character, key, copper):
+        rows = self.amounts.setdefault(character, {key: 0 for key, _ in self.row_defs})
+        rows[key] += copper
+
+    def piece(self, character, key, copper):
+        found = self.pieces.setdefault(character, {key: 0 for key in self.part_keys})
+        found[key] += copper
+
+    def result(self, db, window):
+        """Rows largest first, each with its share per character, and the characters
+        that have any, in their fixed order."""
+        amounts = self.amounts
+        totals = {key: sum(rows[key] for rows in amounts.values()) for key, _ in self.row_defs}
+        order = {key: i for i, (key, _) in enumerate(self.row_defs)}
+        rows = [{"key": key, "label": label, "value": totals[key], "count": self.counts[key],
+                 "by_character": {c: v[key] for c, v in amounts.items() if v[key]}} for key, label in self.row_defs]
+        rows.sort(key=lambda row: (-row["value"], order[row["key"]]))
+        known = _characters(db)
+        for character in amounts:
+            known.setdefault(character, {"id": character, "name": character, "slot": len(known)})
+        characters = [dict(known[c], total=sum(amounts[c].values()))
+                      for c in sorted(amounts, key=lambda c: known[c]["slot"]) if any(amounts[c].values())]
+        return {"start": window["start"], "end": window["end"], "total": sum(totals.values()), "rows": rows,
+                "parts": {key: sum(p[key] for p in self.pieces.values()) for key in self.part_keys},
+                "parts_by_character": self.pieces, "characters": characters, "has_activity": any(totals.values())}
+
+
+def _characters(db):
+    """Every character with a fixed place in line, so it keeps one colour whatever the
+    window or selection: the order each first did anything with money."""
+    rows = db.execute(
+        "SELECT character, MIN(time), (SELECT e2.character_name FROM events e2 WHERE e2.character=e.character "
+        "ORDER BY e2.time DESC LIMIT 1) FROM events e WHERE kind='activity' GROUP BY character "
+        "ORDER BY MIN(time), character").fetchall()
+    short = [(name or character).split("-")[0] for character, _, name in rows]
+    result = {}
+    for slot, ((character, _, name), first) in enumerate(zip(rows, short)):
+        # Two characters with one name on different realms keep the realm to tell them apart.
+        label = first if short.count(first) == 1 else (name or character)
+        result[character] = {"id": character, "name": label, "slot": slot}
+    return result
 
 
 def _item_id(value):
@@ -492,6 +640,15 @@ def _names_by_id(db):
     for (data,) in db.execute("SELECT data FROM events WHERE kind NOT IN ('snapshot','valuation')"):
         walk(json.loads(data))
     return names
+
+
+def item_catalog(db, words="", limit=30):
+    """Items this ledger has named, matching the words, best matches first: [{item_id, name}]."""
+    words = words.strip().casefold()
+    found = [(name.casefold().find(words), name.casefold(), item_id, name)
+             for item_id, name in _names_by_id(db).items() if words in name.casefold()]
+    found.sort(key=lambda row: (row[0] != 0, row[1], row[2]))
+    return [{"item_id": item_id, "name": name} for _, _, item_id, name in found[:limit]]
 
 
 def _unrecorded_vendor_buys(db):
@@ -830,4 +987,4 @@ def figures(db, window_id, chart_range):
     window = resolve_window(db, window_id)
     return {"window": window, "range": chart_range, "start": start_figure(db, window),
             "auction": auction_figure(db, window, chart_range), "value": value_figure(db, window, chart_range),
-            "costs": cost_figure(db, window), "highlights": highlights(db, window)}
+            "costs": cost_figure(db, window), "revenue": revenue_figure(db, window), "highlights": highlights(db, window)}

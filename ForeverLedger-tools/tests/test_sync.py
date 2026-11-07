@@ -76,6 +76,30 @@ class Network:
         self.bare_senders=bare_senders
         self.sent=[]
         self.hidden=[]
+        # Lose one middle part of the next long message, choosing one whose loss still
+        # leaves valid JSON, as the client sometimes does under load.
+        self.lose_a_part=False
+        self.holding={}
+
+    def _lose_a_part(self,sender,target,text):
+        """The parts to deliver now. Holds a long message's parts until its last one."""
+        key=(sender.name,target)
+        if not self.lose_a_part or (text[0]!="F" and key not in self.holding):
+            return [text]
+        parts=self.holding.setdefault(key,[])
+        parts.append(text)
+        if text[0]!="L":
+            return []
+        del self.holding[key]
+        for i in range(1,len(parts)-1):
+            body="".join(p[1:] for j,p in enumerate(parts) if j!=i)
+            try:
+                json.loads(body[body.index("{"):])
+            except ValueError:
+                continue
+            self.lose_a_part=False
+            return parts[:i]+parts[i+1:]
+        return parts
 
     def find(self,name,sender=None):
         for account in self.accounts:
@@ -96,14 +120,15 @@ class Network:
         delivered=0
         for account in self.accounts:
             outgoing=[(m[1],m[2]) for m in account.lua.table_from(account.run("local s=SENT; SENT={}; return s")).values()]
-            for target,text in outgoing:
+            for target,sent in outgoing:
                 delivered+=1
-                self.sent.append((account.name,target,text))
-                other=self.find(target,account)
-                if other:
-                    other.receive(self.sender_name(account),text)
-                else:
-                    self.hidden.append(account.lua.globals().F.SyncHideNotFound(None,"CHAT_MSG_SYSTEM",NOT_FOUND%target))
+                for text in self._lose_a_part(account,target,sent):
+                    self.sent.append((account.name,target,text))
+                    other=self.find(target,account)
+                    if other:
+                        other.receive(self.sender_name(account),text)
+                    else:
+                        self.hidden.append(account.lua.globals().F.SyncHideNotFound(None,"CHAT_MSG_SYSTEM",NOT_FOUND%target))
         return delivered
 
     def settle(self,steps=400):
@@ -600,6 +625,31 @@ class SyncTests(unittest.TestCase):
         self.net.settle()
         self.assertEqual(self.main.run('local _,p=next(F.db.peers); return #p.history'),self.bank.run('return #F.db.history'))
         self.assertEqual(self.chart_gold(self.main),100000+300000+500000)
+
+    def history_times(self,account,peer=False):
+        code='local _,p=next(F.db.peers); return p.history' if peer else 'return F.db.history'
+        return [h["time"] for h in account.lua.table_from(account.run(code)).values()]
+
+    def test_a_long_message_missing_a_part_is_refused_and_fetched_again(self):
+        self.link()
+        self.net.lose_a_part=True
+        self.bank.run('for i=1,60 do NOW=NOW+61; F.character.balance=200000+i*7919; F.RecordValue(true) end')
+        self.net.settle(2000)
+        self.assertFalse(self.net.lose_a_part,"no part was lost")
+        self.assertEqual(self.history_times(self.main,peer=True),self.history_times(self.bank))
+
+    def test_history_synced_by_an_earlier_version_is_fetched_again_once(self):
+        self.bank.run('for i=1,5 do NOW=NOW+60; F.character.balance=200000+i; F.RecordValue(true) end')
+        self.link()
+        self.main.run('local _,p=next(F.db.peers); p.history[3].time=p.history[3].time*10+5; F.db.peerHistoryRefetched=nil')
+        main=self.main.relog("Main-Realm")
+        main.run('F.InstallSync()')
+        net=Network(main,self.bank)
+        net.settle()
+        self.assertEqual(self.history_times(main,peer=True),self.history_times(self.bank))
+        main.run('local _,p=next(F.db.peers); p.history[1].time=1')
+        again=main.relog("Main-Realm")
+        self.assertEqual(again.run('local _,p=next(F.db.peers); return p.history[1].time'),1)
 
     def test_later_samples_hold_earlier_values_of_unchanged_characters(self):
         self.bank.run('NOW=NOW+60; F.character.balance=210000; F.RecordValue(true)')

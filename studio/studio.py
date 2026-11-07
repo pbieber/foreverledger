@@ -3,7 +3,8 @@
 Run:  python studio/studio.py        then open http://127.0.0.1:8765
 Python 3.10+, standard library only. It listens on this computer only, and only ever
 reads WoW's files. TBC, Forever and mock data each stay in their own database. The only
-thing it sends out is item IDs and names, to find icons it doesn't have (--offline stops that).
+thing it sends out is item IDs, item names and item search words, to Wowhead for icons and
+tooltips it doesn't have (--offline stops that).
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ import icons  # noqa: E402
 import ledger  # noqa: E402
 import mockdata  # noqa: E402
 import store  # noqa: E402
+import tooltips  # noqa: E402
 
 SOURCE_LABELS = {"forever": "Forever", "tbc": "TBC Anniversary", "mock": "Mock data"}
 CLIENT_FOLDERS = {"tbc": "_anniversary_", "forever": "_forever_"}
@@ -40,7 +42,8 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/charts.js": ("charts.js", "text/javascript; charset=utf-8"),
           "/coins.js": ("coins.js", "text/javascript; charset=utf-8"),
-          "/mp4.js": ("mp4.js", "text/javascript; charset=utf-8")}
+          "/mp4.js": ("mp4.js", "text/javascript; charset=utf-8"),
+          "/visuals.js": ("visuals.js", "text/javascript; charset=utf-8")}
 
 
 class Conflict(Exception):
@@ -54,6 +57,7 @@ class Studio:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.icons = icons.IconStore(self.data_dir / "icons", pugger_icons, online=online)
+        self.tooltips = tooltips.TooltipStore(self.data_dir / "tooltips", online=online)
         self.plan_path = self.data_dir / "studio.sqlite"
         self.wow_roots = [Path(p) for p in (wow_roots if wow_roots is not None else DEFAULT_WOW_ROOTS)]
         self.import_lock = threading.Lock()
@@ -399,6 +403,45 @@ def get_item(app, body, query, source):
     if item:
         app.icons.attach([item, *(item["recipe"] or {}).get("reagents", [])], source)
     return result
+
+
+def _item_id(query):
+    try:
+        item_id = int(query.get("id", [""])[0])
+    except ValueError:
+        raise store.Invalid("An item ID is a whole number") from None
+    if not 0 < item_id < 10 ** 9:
+        raise store.Invalid("An item ID is a whole number")
+    return item_id
+
+
+@route("GET", r"/api/visual/(\w+)/search")
+def get_visual_search(app, body, query, source):
+    """Items to show: this source's own items first, then anything Wowhead knows by those words."""
+    words = query.get("q", [""])[0][:100]
+    found = []
+    reader = app.read_ledger(_source(source))
+    if reader:
+        with reader as db:
+            found = [dict(item, in_ledger=True) for item in analytics.item_catalog(db, words)]
+    if len(words.strip()) >= 2:
+        known = {item["item_id"] for item in found}
+        found += [dict(item, in_ledger=False) for item in app.tooltips.search(words, source)
+                  if item["item_id"] not in known]
+    return {"items": found, "online": app.tooltips.online}
+
+
+@route("GET", r"/api/visual/(\w+)/item")
+def get_visual_item(app, body, query, source):
+    """One item's icon and tooltip lines. Without a tooltip, only its name is known."""
+    item_id = _item_id(query)
+    tip = app.tooltips.item(item_id, _source(source))
+    fallback = query.get("name", [""])[0].strip()[:200] or f"Item {item_id}"
+    item = {"item_id": item_id, "name": (tip or {}).get("name") or fallback, "quality": (tip or {}).get("quality", 1),
+            "lines": (tip or {}).get("lines") or [], "found": tip is not None,
+            "icon_name": (tip or {}).get("icon_name")}
+    app.icons.attach([item], source)
+    return item
 
 
 class QuietServer(ThreadingHTTPServer):
