@@ -476,7 +476,19 @@ function F.CapturePost(location,duration,quantity,bid,buyout,commodity,confirm)
     else deposit=F.Call(api.CalculateItemDeposit,location,duration,quantity) end
     local d={item=item,duration=duration,quantity=F.Number(quantity),deposit=F.Number(deposit),
         totalPrice=commodity and (F.Number(buyout) or 0)*(F.Number(quantity) or 0) or F.Number(buyout),
-        bid=F.Number(bid),commodity=commodity,clock=F.Clock()}
+        bid=F.Number(bid),commodity=commodity,clock=F.Clock(),
+        guid=F.Call(C_Item and C_Item.GetItemGUID,location),
+        stack=F.Number(F.Call(C_Item and C_Item.GetStackCount,location))}
+    -- Posting several of a non-commodity item makes one auction per item, each at the full
+    -- buyout. Forever (1.60.1) sends no AUCTION_MULTISELL_START for it, and charges each
+    -- auction the single-item deposit (at least 1 silver), not a share of the total.
+    if not commodity and d.quantity and d.quantity>1 then
+        d.multisell=d.quantity
+        d.auctionDeposit=F.Number(F.Call(api.CalculateItemDeposit,location,duration,1))
+    end
+    -- Forever refuses an item (not commodity) buyout with copper in it, without any error
+    -- event: 77 of 77 whole-silver item posts made an auction, the one at 899 copper did not.
+    if not commodity and d.totalPrice and d.totalPrice%100~=0 then d.doubt="copper_price" end
     local function same(p) return p.item.link==d.item.link and p.quantity==d.quantity and p.totalPrice==d.totalPrice end
     -- A Confirm* call completes a warned post; it is the same auction, not another one.
     if confirm then
@@ -487,38 +499,106 @@ function F.CapturePost(location,duration,quantity,bid,buyout,commodity,confirm)
     end
     local last=F.pendingPosts[#F.pendingPosts]
     if last and d.clock-last.clock<0.2 and same(last) then return end
+    -- Posting the very item an earlier post took whole means that post made no auction:
+    -- had it worked, the item would have left the bags.
+    if d.guid then
+        local keep={}
+        for _, p in ipairs(F.pendingPosts) do
+            local whole=p.stack and p.quantity and p.quantity>=p.stack
+            if not (p.guid==d.guid and whole) then keep[#keep+1]=p end
+        end
+        F.pendingPosts=keep
+    end
     F.pendingPosts[#F.pendingPosts+1]=d
     F.Emit("auction_post_intent",d)
 end
 
 -- One multisell call creates `multisell` separate auctions sharing the quantity
--- and deposit; rounding remainders fall to the later auctions.
+-- and deposit; rounding remainders fall to the later auctions. A known per-auction
+-- deposit replaces the share.
 local function nextAuction(d)
     local n=d.multisell
     d.multisell=nil
-    if not n or n<2 then return d,true end
+    if not n or n<2 then
+        if n and d.auctionDeposit then d.deposit=d.auctionDeposit end
+        d.auctionDeposit=nil
+        return d,true
+    end
     local one=F.Copy(d)
     one.quantity=d.quantity and math.floor(d.quantity/n)
-    one.deposit=d.deposit and math.floor(d.deposit/n)
+    one.deposit=d.auctionDeposit or d.deposit and math.floor(d.deposit/n)
+    one.auctionDeposit=nil
     d.quantity=d.quantity and d.quantity-one.quantity
     d.deposit=d.deposit and d.deposit-one.deposit
     d.multisell=n-1; d.clock=F.Clock()
     return one,false
 end
 
+-- The created auction as the owned-auctions list shows it, if the list has it yet.
+local function ownedAuction(id)
+    local api=C_AuctionHouse
+    local owned=api and F.Call(api.GetOwnedAuctions)
+    if type(owned)~="table" then return nil end
+    for _, a in ipairs(owned) do
+        if F.Number(a.auctionID)==F.Number(id) then return a end
+    end
+end
+
+-- The owned list gives an item auction's own buyout, and a commodity's unit price
+-- (65 of 66 fresh Forever listings; a sold one showed the total, so either is accepted).
+local function postFits(p, a)
+    local link=type(a.itemLink)=="string" and a.itemLink or ""
+    local itemID=F.Number(a.itemKey and a.itemKey.itemID) or tonumber(link:match("item:(%d+)"))
+    if not (p.item and p.item.id and p.item.id==itemID) then return false end
+    local quantity=F.Number(a.quantity)
+    local buyout=F.Number(a.buyoutAmount)
+    if p.commodity then
+        return quantity==p.quantity and buyout~=nil and (buyout*quantity==p.totalPrice or buyout==p.totalPrice)
+    end
+    if p.multisell then
+        if quantity~=1 then return false end
+    elseif quantity~=p.quantity then return false end
+    if buyout and buyout>0 then return buyout==p.totalPrice end
+    return F.Number(a.bidAmount)==p.bid
+end
+
+-- The server handles posts in the order they were sent, so the created auction is the
+-- oldest sent post, unless the owned list says otherwise or that post was likely refused.
+-- Sent posts queued before the one chosen never made an auction and are dropped.
 function F.Created(id)
     if F.db.auctions[F.AuctionKey(id)] then return end
-    local keep,d={},nil
+    local live={}
     for _, p in ipairs(F.pendingPosts) do
-        if F.Clock()-p.clock<30 then
-            -- A post waiting on its warning dialog has not created anything yet.
-            if not d and not p.awaitingConfirm then d=p else keep[#keep+1]=p end
+        if F.Clock()-p.clock<30 then live[#live+1]=p end
+    end
+    -- A post waiting on its warning dialog has not created anything yet.
+    local function find(test)
+        for i, p in ipairs(live) do
+            if not p.awaitingConfirm and test(p) then return i end
         end
     end
-    if d then
-        local post,last=nextAuction(d)
-        if not last then table.insert(keep,1,d) end
-        d=post; d.clock=nil; d.matchConfidence="ordered_confirmation"
+    local owned=ownedAuction(id)
+    local pick,confidence
+    if owned then
+        pick=find(function(p) return postFits(p,owned) end)
+        confidence="owned_auction"
+    else
+        pick=find(function(p) return not p.doubt end) or find(function() return true end)
+        confidence="ordered_confirmation"
+    end
+    local keep,d={},nil
+    for i, p in ipairs(live) do
+        if i>(pick or 0) or p.awaitingConfirm then keep[#keep+1]=p end
+    end
+    if pick then
+        local post,last=nextAuction(live[pick])
+        if not last then table.insert(keep,1,live[pick]) end
+        d=post; d.clock=nil; d.doubt=nil; d.guid=nil; d.stack=nil; d.matchConfidence=confidence
+    elseif owned then
+        -- No post fits what the server listed; its listing is better than a wrong guess.
+        d={item=F.Item(owned.itemLink,owned.itemKey and owned.itemKey.itemID),
+            quantity=F.Number(owned.quantity),matchConfidence="owned_auction_only"}
+        keep=live
     end
     F.pendingPosts=keep
     F.Posted(id,d)
@@ -690,7 +770,7 @@ F.events={
     AUCTION_MULTISELL_START=function(count)
         local d=F.pendingPosts[#F.pendingPosts]
         count=F.Number(count)
-        if d and count and count>1 then d.multisell=count end
+        if d and count and count>1 and not d.multisell then d.multisell=count end
     end,
     AUCTION_HOUSE_POST_WARNING=function()
         local d=F.pendingPosts[#F.pendingPosts]

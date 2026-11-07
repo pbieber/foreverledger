@@ -226,8 +226,7 @@ class AddonTests(unittest.TestCase):
 
     def test_multisell_splits_quantity_and_deposit(self):
         self.run_lua('''
-        CalculateDeposit=C_AuctionHouse.CalculateItemDeposit
-        C_AuctionHouse.CalculateItemDeposit=function() return 5003 end
+        C_AuctionHouse.CalculateItemDeposit=function(_,_,q) if q==3 then return 5003 end end
         F.InstallHooks(); C_AuctionHouse.PostItem({link="item:2770"},1,3,0,100000)
         F.events.AUCTION_MULTISELL_START(3); F.Created(55); CLOCK=20; F.Created(56); CLOCK=40; F.Created(57)
         ''')
@@ -239,6 +238,120 @@ class AddonTests(unittest.TestCase):
     def test_commodity_price_is_total(self):
         self.run_lua('F.InstallHooks(); C_AuctionHouse.PostCommodity({link="item:2770"},1,20,100); F.Created(55)')
         self.assertEqual(self.kind("auction_posted")[0]["totalPrice"],2000)
+
+    # Item locations in these tests carry their own GUID, stack size and deposit.
+    POSTING='''
+    C_Item.GetItemGUID=function(loc) return loc.guid end
+    C_Item.GetStackCount=function(loc) return loc.stack end
+    C_AuctionHouse.CalculateItemDeposit=function(loc,_,q) return loc.deposit and (q==1 and loc.deposit or loc.total) end
+    F.InstallHooks()
+    function POST(link,guid,price,deposit,quantity,stack)
+        C_AuctionHouse.PostItem({link=link,guid=guid,stack=stack or 1,deposit=deposit},2,quantity or 1,0,price)
+    end
+    '''
+
+    def posted_by_id(self):
+        return {p["auctionID"]:(p.get("item",{}).get("link"),p.get("totalPrice"),p.get("deposit"),p.get("quantity"))
+            for p in self.kind("auction_posted")}
+
+    def test_refused_copper_post_does_not_shift_later_auctions(self):
+        # 5 Nov, Sare: the 899 Heavy Shortbow post made no auction and the bow was posted again at 900.
+        self.run_lua(self.POSTING+'''
+        CLOCK=100.0; POST("item:3036","G-bow",899,103)
+        CLOCK=109.5; POST("item:3036","G-bow",900,103); F.Created(1019683)
+        CLOCK=117.5; POST("item:14559","G-sash",1200,100); F.Created(1020101)
+        CLOCK=126.1; POST("item:15945","G-stave",1000,167); F.Created(1020536)
+        CLOCK=132.5; POST("item:2580","G-cape",200,100); F.Created(1020868)
+        CLOCK=135.7; POST("item:3305","G-legs",800,100); F.Created(1021047)
+        ''')
+        self.assertEqual(self.posted_by_id(),{
+            1019683:("item:3036",900,103,1), 1020101:("item:14559",1200,100,1),
+            1020536:("item:15945",1000,167,1), 1020868:("item:2580",200,100,1),
+            1021047:("item:3305",800,100,1)})
+        self.assertEqual(self.kind("auction_post_intent")[0]["doubt"],"copper_price")
+        self.assertEqual(self.run_lua("return #F.pendingPosts"),0)
+
+    def test_copper_post_that_is_not_reposted_is_passed_over(self):
+        self.run_lua(self.POSTING+'''
+        POST("item:3036",nil,899,103); CLOCK=5; POST("item:14559",nil,1200,100); F.Created(56)
+        ''')
+        self.assertEqual(self.posted_by_id()[56],("item:14559",1200,100,1))
+        self.assertEqual(self.run_lua("return #F.pendingPosts"),0)
+
+    def test_copper_post_alone_is_still_recorded(self):
+        self.run_lua(self.POSTING+'POST("item:3036",nil,899,103); F.Created(56)')
+        self.assertEqual(self.posted_by_id()[56],("item:3036",899,103,1))
+
+    def test_reposting_the_same_item_drops_the_post_that_failed(self):
+        self.run_lua(self.POSTING+'''
+        POST("item:3036","G-bow",1500,103); CLOCK=8; POST("item:3036","G-bow",1400,103); F.Created(56)
+        ''')
+        self.assertEqual(self.posted_by_id()[56],("item:3036",1400,103,1))
+        self.assertEqual(len(self.kind("auction_post_intent")),2)
+        self.assertEqual(self.run_lua("return #F.pendingPosts"),0)
+
+    def test_part_of_a_stack_posted_twice_keeps_both_posts(self):
+        self.run_lua(self.POSTING+'''
+        POST("item:2770","G-ore",100,100,1,5); CLOCK=1; POST("item:2770","G-ore",200,100,1,4)
+        F.Created(55); F.Created(56)
+        ''')
+        by_id=self.posted_by_id()
+        self.assertEqual((by_id[55][1],by_id[56][1]),(100,200))
+
+    def test_owned_listing_picks_the_post_and_drops_older_ones(self):
+        self.run_lua(self.POSTING+'''
+        POST("item:3036",nil,1500,103); CLOCK=3; POST("item:999",nil,7000,100)
+        OWNED={{auctionID=57,itemKey={itemID=999},quantity=1,buyoutAmount=7000}}
+        F.Created(57); OWNED=nil; F.Created(58)
+        ''')
+        by_id=self.posted_by_id()
+        self.assertEqual(by_id[57],("item:999",7000,100,1))
+        self.assertEqual(self.kind("auction_posted")[0]["matchConfidence"],"owned_auction")
+        self.assertEqual(by_id[58],(None,None,None,None))
+
+    def test_owned_listing_with_no_fitting_post_keeps_the_queue(self):
+        self.run_lua(self.POSTING+'''
+        POST("item:3036",nil,1500,103)
+        OWNED={{auctionID=57,itemKey={itemID=999},itemLink="item:999",quantity=1,buyoutAmount=7000}}
+        F.Created(57); OWNED=nil; F.Created(58)
+        ''')
+        first,second=self.kind("auction_posted")
+        self.assertEqual((first["item"]["id"],first["matchConfidence"]),(999,"owned_auction_only"))
+        self.assertNotIn("deposit",first)
+        self.assertEqual(second["item"]["link"],"item:3036")
+
+    def test_owned_listing_gives_commodities_a_unit_price(self):
+        self.run_lua('''
+        F.InstallHooks(); C_AuctionHouse.PostCommodity({link="item:2770"},1,20,100)
+        C_AuctionHouse.PostCommodity({link="item:118"},1,2,250)
+        OWNED={{auctionID=55,itemKey={itemID=118},quantity=2,buyoutAmount=250}}
+        F.Created(55)
+        ''')
+        posted=self.kind("auction_posted")[0]
+        self.assertEqual((posted["item"]["link"],posted["totalPrice"],posted["matchConfidence"]),("item:118",500,"owned_auction"))
+
+    def test_forever_multisell_without_event_makes_one_auction_per_item(self):
+        # 5 Nov, Sare: Minor Wizard Oil x3 at 300 each; Modars: Woolen Bag x4, 240 deposit quoted, 100 charged each.
+        self.run_lua(self.POSTING+'''
+        C_AuctionHouse.PostItem({link="item:3172",stack=5,deposit=100,total=100},2,3,0,300)
+        F.Created(1696986); CLOCK=1; F.Created(1697023); F.Created(1697048)
+        CLOCK=10; C_AuctionHouse.PostItem({link="item:4241",stack=1,deposit=100,total=240},2,4,0,2100)
+        for id=2255747,2255750 do F.Created(id) end
+        CLOCK=20; POST("item:3305",nil,800,100); F.Created(9)
+        ''')
+        by_id=self.posted_by_id()
+        self.assertEqual([by_id[i] for i in (1696986,1697023,1697048)],[("item:3172",300,100,1)]*3)
+        self.assertEqual([by_id[i] for i in range(2255747,2255751)],[("item:4241",2100,100,1)]*4)
+        self.assertEqual(by_id[9],("item:3305",800,100,1))
+        self.assertEqual(self.run_lua("return #F.pendingPosts"),0)
+
+    def test_multisell_event_after_capture_does_not_add_an_auction(self):
+        self.run_lua(self.POSTING+'''
+        C_AuctionHouse.PostItem({link="item:3172",stack=5,deposit=100,total=100},2,3,0,300)
+        F.Created(1); F.events.AUCTION_MULTISELL_START(3); F.Created(2); F.Created(3)
+        POST("item:3305",nil,800,100); F.Created(4)
+        ''')
+        self.assertEqual(self.posted_by_id()[4],("item:3305",800,100,1))
 
     def post(self,id=55):
         self.run_lua(f'F.Posted({id},{{item={{id=2770,name="Copper Ore"}},quantity=1,deposit=5000,totalPrice=100000}})')
