@@ -626,7 +626,7 @@ function F.InstallHooks()
             {item=F.Item(F.Call(GetBuybackItemLink,index)),quantity=v[4]}) end
     end)
     Hook("RepairAllItems",function(guild)
-        if not guild and F.repairCost then F.Intent("repair",-F.repairCost,{}) end
+        if not guild and F.repairCost then F.Intent("repair",-F.repairCost,F.WithStanding({})) end
     end)
     Hook("TakeTaxiNode",function(index)
         local price=F.Number(F.Call(TaxiNodeCost,index))
@@ -639,12 +639,22 @@ function F.InstallHooks()
         if not cost then return end
         local d={service=F.Call(GetTrainerServiceInfo,index),skillLine=F.Call(GetTrainerServiceSkillLine,index)}
         if type(IsTradeskillTrainer)=="function" then d.trainer=F.Call(IsTradeskillTrainer) and "profession" or "class" end
-        F.Intent("training",-cost,d)
+        F.Intent("training",-cost,F.WithStanding(d))
     end)
     for _, def in ipairs({{"DepositMoney","bank_deposit",-1},{"WithdrawMoney","bank_withdrawal",1}}) do
         local name,category,sign=def[1],def[2],def[3]
         Hook(C_Bank,name,function(bankType,amount) F.Intent(category,sign*amount,{bankType=bankType}) end)
     end
+end
+
+-- A repair or training cost already has any reputation discount taken off. The
+-- NPC's reaction to the player is that standing; it and this client's discount for
+-- it are kept, so the full price can be worked out later from the record alone.
+function F.WithStanding(d)
+    d.standing=F.Number(F.Call(UnitReaction,"npc","player"))
+    d.discount=F.ReputationDiscount(d.standing)
+    d.npc=F.Call(GetUnitName,"npc",true)
+    return d
 end
 
 function F.ParseMoney(text)

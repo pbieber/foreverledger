@@ -582,6 +582,89 @@ function GetTrainerServiceSkillLine() return "Tailoring" end
         self.assertEqual((training["category"],training["amount"]),("training",-500))
         self.assertNotIn("trainer",training)
 
+    def repair(self,standing,cost):
+        self.run_lua(f'function UnitReaction() return {standing} end\n'
+            f'function GetRepairAllCost() return {cost} end\n'
+            f'F.events.MERCHANT_SHOW(); RepairAllItems(); F.ObserveBalance(GetMoney()-{cost}); WALLET=WALLET-{cost}; F.Flush()')
+
+    def train(self,standing,cost):
+        self.run_lua(f'function UnitReaction() return {standing} end\n'
+            f'function GetTrainerServiceCost() return {cost} end\n'
+            f'BuyTrainerService(3); F.ObserveBalance(GetMoney()-{cost}); WALLET=WALLET-{cost}; F.Flush()')
+
+    def lines(self):
+        return self.run_lua('return table.concat(F.ReputationSavingsLines(),string.char(10))')
+
+    def test_repair_records_the_vendors_standing_and_discount(self):
+        self.run_lua('F.InstallHooks()')
+        self.repair(7,8500)
+        repair=self.kind("activity")[0]
+        self.assertEqual((repair["category"],repair["amount"],repair["standing"],repair["discount"],repair["npc"]),
+            ("repair",-8500,7,10,"Bank-Realm"))
+
+    def test_training_records_the_trainers_standing_and_discount(self):
+        self.run_lua(self.TRAINER_MOCKS+'F.InstallHooks()')
+        self.train(6,900)
+        training=self.kind("activity")[0]
+        self.assertEqual((training["category"],training["amount"],training["service"],training["standing"],training["discount"],training["npc"]),
+            ("training",-900,"Linen Belt",6,10,"Bank-Realm"))
+
+    def savings_by_standing(self,category="repair"):
+        r=self.run_lua(f'local r=F.ReputationSavings("{category}"); local t={{r.count,r.paid,r.full,r.saved}} '
+            'for s=1,8 do t[#t+1]=r.byStanding[s] and r.byStanding[s].saved or -1 end return t')
+        return list(r.values())
+
+    def test_forever_repairs_save_ten_percent_from_honored_up(self):
+        self.run_lua('F.InstallHooks()')
+        for standing in (8,7,6):
+            self.repair(standing,9000)
+        self.repair(5,1000)
+        self.repair(4,1000)
+        # Totals, then the saving at each standing from Hated to Exalted (-1: none recorded).
+        self.assertEqual(self.savings_by_standing(),[5,29000,32000,3000,-1,-1,-1,0,0,1000,1000,1000])
+
+    def test_tbc_repairs_save_more_at_each_standing_from_friendly(self):
+        self.run_lua('F.InstallHooks(); F.isTBC=true')
+        self.repair(8,8000)
+        self.repair(7,8500)
+        self.repair(6,9000)
+        self.repair(5,9500)
+        self.repair(4,1000)
+        self.assertEqual(self.savings_by_standing(),[5,36000,41000,5000,-1,-1,-1,0,500,1000,1500,2000])
+
+    def test_training_savings_are_counted_apart_from_repairs(self):
+        self.run_lua(self.TRAINER_MOCKS+'F.InstallHooks(); F.isTBC=true')
+        self.train(8,8000)
+        self.train(4,500)
+        self.repair(6,9000)
+        self.assertEqual(self.savings_by_standing("training"),[2,8500,10500,2000,-1,-1,-1,0,-1,-1,-1,2000])
+        self.assertEqual(self.savings_by_standing("repair")[:4],[1,9000,10000,1000])
+        lines=self.lines()
+        self.assertIn("Repairs: 1 paid",lines)
+        self.assertIn("Training: 2 paid",lines)
+        self.assertIn("Total saved: "+self.run_lua("return F.Money(3000)"),lines)
+
+    def test_savings_leave_out_records_without_a_standing(self):
+        self.run_lua(self.TRAINER_MOCKS+'F.InstallHooks(); F.events.MERCHANT_SHOW(); RepairAllItems(); WALLET=WALLET-150; F.ObserveBalance(WALLET); F.Flush()')
+        self.run_lua('BuyTrainerService(3); WALLET=WALLET-500; F.ObserveBalance(WALLET); F.Flush()')
+        self.repair(6,900)
+        r=self.run_lua('local r=F.ReputationSavings("repair"); return {r.count,r.saved,r.unknown.count,r.unknown.paid}')
+        self.assertEqual(list(r.values()),[1,100,1,150])
+        lines=self.lines()
+        self.assertIn("Honored (10% off): 1",lines)
+        self.assertIn("Training: none with a standing recorded yet.",lines)
+        self.assertIn("so left out: 1 repairs",lines)
+        self.assertIn(", 1 training",lines)
+        self.assertIn("Reputation discounts",self.run_lua('return F.Summary()'))
+
+    def test_savings_command_prints_the_comparison(self):
+        self.run_lua('F.InstallHooks()')
+        self.repair(8,8000)
+        self.run_lua('MESSAGES={}; F.Command("savings")')
+        printed=self.run_lua('local t={} for _,m in ipairs(MESSAGES) do t[#t+1]=m[1] end return table.concat(t,string.char(10))')
+        self.assertIn("Repairs: 1 paid",printed)
+        self.assertIn("Exalted (10% off)",printed)
+
     def test_mail_send_postage_separate(self):
         self.run_lua('F.InstallHooks(); SendMail("Bank-Realm"); F.events.MAIL_SEND_SUCCESS()')
         self.assertEqual([e["amount"] for e in self.kind("activity")],[-10000,-30])
@@ -882,6 +965,25 @@ class ImportTests(unittest.TestCase):
         r=ledger.report(self.db)
         self.assertEqual(r["classified_external_cash_out"],10030)
         self.assertEqual(r["unresolved_reconciliation"],[])
+
+    def test_report_compares_repairs_and_training_with_their_full_price(self):
+        events=[event("one",1,"activity",dict(category="repair",amount=-8500,standing=7,discount=15)),
+            event("one",2,"activity",dict(category="repair",amount=-9000,standing=7,discount=10)),
+            event("one",3,"activity",dict(category="repair",amount=-1000,standing=4,discount=0)),
+            event("one",4,"activity",dict(category="repair",amount=-500)),
+            event("one",5,"activity",dict(category="repair",amount=-700,standing=6)),
+            event("one",6,"activity",dict(category="training",amount=-9000,standing=6,discount=10,service="Linen Belt")),
+            event("one",7,"activity",dict(category="training",amount=-300,service="Bandage"))]
+        ledger.import_file(self.db,self.save("one",events))
+        savings=ledger.report(self.db)["reputation_savings"]
+        training=savings["training"]
+        self.assertEqual((training["count"],training["paid"],training["full_price"],training["saved"]),(1,9000,10000,1000))
+        self.assertEqual(training["not_compared"],{"count":1,"paid":300})
+        r=savings["repair"]
+        self.assertEqual((r["count"],r["paid"],r["full_price"],r["saved"]),(3,18500,21000,2500))
+        self.assertEqual({k:v["saved"] for k,v in r["by_standing"].items()},
+            {"Revered (15% off)":1500,"Revered (10% off)":1000,"Neutral (0% off)":0})
+        self.assertEqual(r["not_compared"],{"count":2,"paid":1200})
 
     def test_skipped_backfill_leaves_gold_unresolved(self):
         events=[event("one",1,"reconciliation",dict(balanceIDs=[],observed=9,explained=0,residual=9,status="unresolved")),

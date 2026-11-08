@@ -55,6 +55,8 @@ A `snapshot` is written when a location's contents change, or on an explicit ref
 
 A `training` intent, and the activity it becomes, carries the `service` bought, its `skillLine` and `trainer` (`class` or `profession`, from `IsTradeskillTrainer`). Records made before `trainer` existed, or on a client without that function, leave it out.
 
+A `repair` or `training` intent, and its activity, carries the vendor's or trainer's `standing` toward the player (`UnitReaction`, 1 Hated to 8 Exalted), the `discount` percent that client gives at that standing, and the `npc` name. The amount already has the discount taken off, so the full price is estimated from `discount`. Forever gives 10% from Honored up. TBC gives 5% at Friendly, 10% at Honored, 15% at Revered and 20% at Exalted. The discount is saved because a record doesn't say which client made it. Records made without `discount` are counted apart in reputation savings.
+
 An intent alone is not a transaction. Confirmed event activity can precede or follow `PLAYER_MONEY`; the collector waits for a two-second quiet window before writing a reconciliation record. A unique amount match becomes `correlated_amount`; an exact sum of multiple pending intents becomes `correlated_batch`. Neither is a server-confirmed cause. Ambiguous or stale candidates remain intents. Unresolved windows are retained even if later windows happen to offset them.
 
 ## Auction confidence

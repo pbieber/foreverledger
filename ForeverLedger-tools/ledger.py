@@ -271,6 +271,34 @@ def all_events(db):
     return [json.loads(r[0]) for r in db.execute("SELECT raw FROM events ORDER BY time,source_id,sequence")]
 
 
+STANDINGS = {1: "Hated", 2: "Hostile", 3: "Unfriendly", 4: "Neutral", 5: "Friendly", 6: "Honored", 7: "Revered", 8: "Exalted"}
+
+
+# What a reputation discount applies to.
+DISCOUNTED = ("repair", "training")
+
+
+def full_price(paid, percent):
+    """What a cost would have been undiscounted, to the nearest copper."""
+    return int(paid*100/(100-percent)+0.5)
+
+
+def add_reputation_saving(savings, d):
+    """Count one repair or training record against its full price."""
+    paid=-d["amount"]
+    # The discount differs between clients, so only the one saved with the record is used.
+    if d.get("standing") is None or d.get("discount") is None:
+        savings["not_compared"]["count"]+=1
+        savings["not_compared"]["paid"]+=paid
+        return
+    full=full_price(paid,d["discount"])
+    # Keyed with the discount too: the same standing gives less on Forever than on TBC.
+    name=f'{STANDINGS.get(d["standing"],d["standing"])} ({d["discount"]}% off)'
+    row=savings["by_standing"].setdefault(name,{"count":0,"paid":0,"full_price":0,"saved":0})
+    for totals in (row,savings):
+        totals["count"]+=1; totals["paid"]+=paid; totals["full_price"]+=full; totals["saved"]+=full-paid
+
+
 def report(db, costs=None):
     events = all_events(db)
     owners = owned_keys(db)
@@ -279,6 +307,8 @@ def report(db, costs=None):
     valuations = {}
     net, transfers, external_in, external_out, storage_transfers = 0, 0, 0, 0, 0
     attempts, outcomes, sales, cancel_fees = {}, {}, [], []
+    reputation = {category:{"count":0,"paid":0,"full_price":0,"saved":0,"by_standing":{},"not_compared":{"count":0,"paid":0}}
+        for category in DISCOUNTED}
     def item_row(item):
         key = str(item.get("id")) if item.get("id") else "name:"+str(item.get("name", "unknown"))
         return items.setdefault(key, {"item_key":key,"name":item.get("name"),"listings":0,
@@ -323,6 +353,8 @@ def report(db, costs=None):
                 item_row(d["item"])["purchase_spend"]+=-d["amount"]
             if d["category"]=="auction_cancel_fee":
                 cancel_fees.append(d)
+            if d["category"] in DISCOUNTED and d["amount"]<0:
+                add_reputation_saving(reputation[d["category"]],d)
         elif k=="reconciliation" and d["residual"] and not corrected.intersection(d["balanceIDs"]) and e["id"] not in backfilled:
             unresolved.append({"event":e["id"],"residual":d["residual"]})
         elif k=="snapshot":
@@ -406,14 +438,15 @@ def report(db, costs=None):
         "internal_transfer_net":transfers,"bank_wallet_transfer_net":storage_transfers,"balances":list(balances.values()),
         "unresolved_reconciliation":unresolved,"login_gaps":login_gaps,"incomplete_imports":missing_sequences,
         "unmatched_auction_returns":unmatched_returns,"collector_diagnostics":diagnostics,
-        "deposits_without_matched_outcome":unresolved_deposits,
+        "deposits_without_matched_outcome":unresolved_deposits,"reputation_savings":reputation,
         "items":list(items.values()),"latest_snapshots":inventory,"latest_valuations":list(valuations.values()),
         "notes":["Gold changes and activities are two views of the same money; do not add them together.",
             "Internal-transfer net may be nonzero for gold in transit or missing account exports.",
             "Snapshot values are last observed and may overlap after movements; do not sum into exact net worth.",
             "Item margins cover captured history and allocated failures, before acquisition cost unless supplied.",
             "Purchase spend is not cost of goods sold: some purchased stock may still be held.",
-            "Mail and sold-auction snapshots can describe the same proceeds; do not add both."]}
+            "Mail and sold-auction snapshots can describe the same proceeds; do not add both.",
+            "Repair and training full prices are estimated from the reputation discount saved with each record; records without one are counted apart."]}
 
 
 def export_csv(db, folder):

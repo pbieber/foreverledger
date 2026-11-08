@@ -53,6 +53,8 @@ function F.Summary()
         end
     end
     lines[#lines+1]=""
+    for _,line in ipairs(F.ReputationSavingsLines()) do lines[#lines+1]=line end
+    lines[#lines+1]=""
     lines[#lines+1]="Total value = gold + other assets + Equipped Gear. Estimates are not income."
     lines[#lines+1]="Bank/mail/AH and offline alts are last observed; stale snapshots may overlap."
     lines[#lines+1]="DE is expected net material value, available for bound gear only to its enchanter owner."
@@ -61,7 +63,7 @@ function F.Summary()
     lines[#lines+1]="Linked accounts show their last synced values. Their raw records stay on that account; the database combines both."
     lines[#lines+1]=""
     lines[#lines+1]="Commands: /fl account Main | /fl own Name-Realm | /fl episode Episode 1"
-    lines[#lines+1]="/fl end | /fl scan | /fl sync | /fl profit | /fl prices all | /fl prices oldest | /fl prices stop"
+    lines[#lines+1]="/fl end | /fl scan | /fl sync | /fl profit | /fl savings | /fl prices all | /fl prices oldest | /fl prices stop"
     lines[#lines+1]="/fl highlight [note] marks a moment to find in the recording; /fl highlight undo takes the last one back."
     return table.concat(lines,"\n")
 end
@@ -220,6 +222,7 @@ function F.Command(input)
         else F.Print("Use /fl prices all, /fl prices oldest or /fl prices stop.") end
     elseif command=="sync" then F.SyncCommand(rest)
     elseif command=="profit" then F.Show("profit")
+    elseif command=="savings" then for _,line in ipairs(F.ReputationSavingsLines()) do F.Print(line) end
     elseif command=="fee" then
         local percent=tonumber(rest)
         if percent and percent>=0 and percent<=100 then

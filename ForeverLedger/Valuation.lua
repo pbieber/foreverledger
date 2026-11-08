@@ -583,6 +583,84 @@ function F.GainBreakdown(characters,now)
     return gain,rows,start
 end
 
+-- Percent a vendor or trainer takes off at each standing (the 1-8 of UnitReaction).
+-- TBC rises from 5% at Friendly to 20% at Exalted. Forever keeps the original
+-- game's single 10% from Honored up.
+F.REPUTATION_DISCOUNTS={tbc={[5]=5,[6]=10,[7]=15,[8]=20},forever={[6]=10,[7]=10,[8]=10}}
+local STANDING_NAMES={"Hated","Hostile","Unfriendly","Neutral","Friendly","Honored","Revered","Exalted"}
+-- What a reputation discount applies to, in the order the summary lists them.
+F.DISCOUNTED={{category="repair",label="Repairs"},{category="training",label="Training"}}
+
+function F.StandingName(standing)
+    return _G["FACTION_STANDING_LABEL"..tostring(standing)] or STANDING_NAMES[standing] or "Unknown"
+end
+
+-- The discount this client gives at a standing, or nil when the standing is unknown.
+function F.ReputationDiscount(standing)
+    if not standing then return nil end
+    return F.REPUTATION_DISCOUNTS[F.isTBC and "tbc" or "forever"][standing] or 0
+end
+
+-- What a cost would have been with no discount. The game rounds the discounted
+-- price, so this is an estimate to the nearest copper.
+function F.FullPrice(paid,percent)
+    return math.floor(paid*100/(100-percent)+0.5)
+end
+
+-- Costs of one category (repair or training) paid against what they would have
+-- been at full price, using the discount saved with each record. Records without
+-- one go in `unknown`, not into the comparison.
+function F.ReputationSavings(category)
+    local result={count=0,paid=0,full=0,saved=0,unknown={count=0,paid=0},byStanding={}}
+    for _,e in ipairs(F.db.events) do
+        local d=e.data
+        if e.kind=="activity" and d.category==category and (d.amount or 0)<0 then
+            local paid=-d.amount
+            if d.standing and d.discount then
+                local full=F.FullPrice(paid,d.discount)
+                local row=result.byStanding[d.standing] or {standing=d.standing,discount=d.discount,count=0,paid=0,full=0,saved=0}
+                result.byStanding[d.standing]=row
+                for _,t in ipairs({row,result}) do
+                    t.count=t.count+1; t.paid=t.paid+paid; t.full=t.full+full; t.saved=t.saved+full-paid
+                end
+            else
+                result.unknown.count=result.unknown.count+1; result.unknown.paid=result.unknown.paid+paid
+            end
+        end
+    end
+    return result
+end
+
+function F.ReputationSavingsLines()
+    local lines={"Reputation discounts (full price estimated from the vendor's or trainer's standing):"}
+    local total,unknown=0,{}
+    for _,kind in ipairs(F.DISCOUNTED) do
+        local r=F.ReputationSavings(kind.category)
+        if r.count==0 then
+            lines[#lines+1]=kind.label..": none with a standing recorded yet."
+        else
+            total=total+r.saved
+            lines[#lines+1]=string.format("%s: %d paid %s, full price %s, saved %s",
+                kind.label,r.count,F.Money(r.paid),F.Money(r.full),F.Money(r.saved))
+            for standing=8,1,-1 do
+                local row=r.byStanding[standing]
+                if row then
+                    lines[#lines+1]=string.format("  %s (%d%% off): %d paid %s, saved %s",F.StandingName(standing),
+                        row.discount,row.count,F.Money(row.paid),F.Money(row.saved))
+                end
+            end
+        end
+        if r.unknown.count>0 then
+            unknown[#unknown+1]=string.format("%d %s (%s)",r.unknown.count,kind.label:lower(),F.Money(r.unknown.paid))
+        end
+    end
+    lines[#lines+1]="Total saved: "..F.Money(total)
+    if #unknown>0 then
+        lines[#lines+1]="Recorded before standings were kept, so left out: "..table.concat(unknown,", ").."."
+    end
+    return lines
+end
+
 -- Episode starts and ends inside a time range. An end that overlaps the next
 -- start is dropped, so only that start shows.
 function F.EpisodeMarkers(first,last,overlap)
