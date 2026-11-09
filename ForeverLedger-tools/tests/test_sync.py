@@ -697,6 +697,112 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(self.bank.printed("unlinked this account"))
         self.assertEqual(len([e for e in json.loads(self.main.run('return F.Export(1,100000)'))["events"] if e["kind"]=="sync_unlinked"]),1)
 
+    def marker(self,account):
+        return account.result('{name=F.db.episode,at=F.db.markerAt,gain=F.GainStart(F.Now())}')
+
+    def marker_events(self,account):
+        return [e for e in json.loads(account.run('return F.Export(1,100000)'))["events"]
+                if e["kind"] in ("episode_start","episode_end")]
+
+    def apart(self):
+        """The bank account goes offline after linking."""
+        self.link()
+        self.net.accounts.remove(self.bank)
+        self.main.run('F.SyncOffline("Bank-Realm")')
+        for _ in range(15):
+            self.net.step()
+
+    def together(self):
+        self.net.accounts.append(self.bank)
+        self.bank.run('F.SyncNow()')
+        self.net.settle()
+
+    def test_a_marker_set_on_one_account_starts_on_the_other_at_the_same_moment(self):
+        self.link()
+        self.main.run('NOW=NOW+100; F.SetMarker("Episode 3")')
+        started=self.main.run('return NOW')
+        self.net.settle()
+        self.assertEqual(self.marker(self.bank),self.marker(self.main))
+        self.assertEqual((self.marker(self.bank)["name"],self.marker(self.bank)["gain"]),("Episode 3",started))
+        synced=self.marker_events(self.bank)[-1]
+        self.assertEqual((synced["kind"],synced["data"]["occurredAt"],synced["episode"]),("episode_start",started,"Episode 3"))
+        self.assertTrue(self.bank.printed("Marker from Main-Realm: Episode 3"))
+        # Neither account sends it back and forth.
+        self.assertEqual(len(self.marker_events(self.main)),1)
+        self.assertEqual(len(self.marker_events(self.bank)),1)
+
+    def test_ending_the_marker_on_either_account_ends_it_on_both(self):
+        self.link()
+        self.main.run('F.SetMarker("Episode 3")')
+        self.net.settle()
+        self.bank.run('NOW=NOW+50; F.Command("end")')
+        ended=self.bank.run('return NOW')
+        self.net.settle()
+        for account in (self.main,self.bank):
+            self.assertEqual(self.marker(account)["at"],ended)
+            self.assertNotIn("name",self.marker(account))
+        self.assertEqual(self.marker_events(self.main)[-1]["kind"],"episode_end")
+        self.assertTrue(self.main.printed("Marker ended on Bank."))
+        self.together_again_changes_nothing()
+
+    def together_again_changes_nothing(self):
+        before=(len(self.marker_events(self.main)),len(self.marker_events(self.bank)))
+        self.net.accounts.remove(self.bank)
+        self.main.run('F.SyncOffline("Bank-Realm")')
+        self.together()
+        self.assertEqual((len(self.marker_events(self.main)),len(self.marker_events(self.bank))),before)
+
+    def test_a_marker_set_while_the_other_account_is_away_keeps_its_start(self):
+        self.apart()
+        self.main.run('NOW=NOW+100; F.SetMarker("Episode 3")')
+        started=self.main.run('return NOW')
+        self.bank.run('NOW=NOW+900')
+        self.together()
+        self.assertEqual(self.marker(self.bank),self.marker(self.main))
+        self.assertEqual(self.marker(self.bank)["gain"],started)
+
+    def test_the_same_marker_set_on_both_counts_from_the_earlier_start(self):
+        self.apart()
+        self.main.run('NOW=NOW+100; F.SetMarker("Episode 3")')
+        started=self.main.run('return NOW')
+        self.bank.run('NOW=NOW+400; F.SetMarker("Episode 3")')
+        self.together()
+        for account in (self.main,self.bank):
+            self.assertEqual((self.marker(account)["name"],self.marker(account)["gain"]),("Episode 3",started))
+        # Setting it again by habit while linked moves nothing.
+        self.bank.run('NOW=NOW+60; F.SetMarker("Episode 3")')
+        self.net.settle()
+        self.assertTrue(self.bank.printed("Marker Episode 3 is already running."))
+        self.assertEqual(self.marker(self.main)["gain"],started)
+        self.assertEqual(self.marker(self.bank)["gain"],started)
+        markers=self.bank.result('F.EpisodeMarkers(0,NOW,1)')
+        self.assertEqual([(m["time"],m["name"]) for m in markers],[(started,"Episode 3")])
+
+    def test_the_latest_marker_wins_after_being_apart(self):
+        self.apart()
+        self.bank.run('NOW=NOW+100; F.SetMarker("Old")')
+        self.main.run('NOW=NOW+200; F.SetMarker("New")')
+        started=self.main.run('return NOW')
+        self.together()
+        for account in (self.main,self.bank):
+            self.assertEqual((self.marker(account)["name"],self.marker(account)["gain"]),("New",started))
+
+    def test_a_marker_popup_closes_when_the_other_account_sets_one(self):
+        self.link()
+        self.bank.run('HIDDEN={}; StaticPopup_Hide=function(name) HIDDEN[#HIDDEN+1]=name end')
+        self.main.run('F.SetMarker("Episode 3")')
+        self.net.settle()
+        self.assertIn("FOREVERLEDGER_MARKER",self.bank.result('HIDDEN'))
+
+    def test_a_received_marker_is_checked(self):
+        self.link()
+        source,key=self.bank.run('return F.db.sourceID'),self.main.run('local _,p=next(F.db.peers); return p.key')
+        for e in ('{"a":"soon","n":"X"}','{"a":-5,"n":"X"}','"text"','{"a":99999999999,"n":{"x":1}}'):
+            self.main.receive("Bank-Realm",'S{"e":%s,"k":"%s","s":"%s","t":"marker"}'%(e,key,source))
+        self.assertIsNone(self.main.run('return F.db.episode'))
+        self.main.receive("Bank-Realm",'S{"e":{"a":99999999999,"n":"Fine|cff"},"k":"%s","s":"%s","t":"marker"}'%(key,source))
+        self.assertEqual(self.main.run('return F.db.episode'),"Finecff")
+
     def test_a_key_from_an_old_link_is_refused_after_relinking(self):
         self.link()
         old=self.main.run('local _,p=next(F.db.peers); return p.key')

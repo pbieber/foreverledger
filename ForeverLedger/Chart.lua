@@ -192,6 +192,13 @@ local function showBand(owner,point,key,c)
     GameTooltip:Show()
 end
 
+-- Over a band's area: only that band's value. The breakdown waits for its line.
+local function showArea(owner,point,key)
+    GameTooltip:SetOwner(owner,"ANCHOR_CURSOR")
+    GameTooltip:AddDoubleLine(bandName(key),F.Money(F.BandValue(point,key)),1,1,1,1,1,1)
+    GameTooltip:Show()
+end
+
 local function showValue(owner,point,characters)
     GameTooltip:SetOwner(owner,"ANCHOR_CURSOR")
     GameTooltip:AddDoubleLine("Total Value",F.Money(point.totals.total),1,1,1,1,1,1)
@@ -592,7 +599,7 @@ function F.BuildChart(parent)
         local cx,cy=GetCursorPosition()
         local scale=self:GetEffectiveScale()
         local t=c.first+math.max(0,math.min(1,(cx/scale-self:GetLeft())/PLOT_WIDTH))*c.span
-        local point,line=F.HistoryAt(c.points,t,(cy/scale-self:GetBottom())/PLOT_HEIGHT*c.maximum,8/PLOT_HEIGHT*c.maximum)
+        local point,line,area=F.HistoryAt(c.points,t,(cy/scale-self:GetBottom())/PLOT_HEIGHT*c.maximum,8/PLOT_HEIGHT*c.maximum)
         local v=point.totals
         local x=(point.time-c.first)/c.span*PLOT_WIDTH
         c.cross:ClearAllPoints(); c.cross:SetPoint("BOTTOMLEFT",x,0); c.cross:Show()
@@ -600,10 +607,12 @@ function F.BuildChart(parent)
         if x>PLOT_WIDTH-140 then c.total:SetPoint("TOPRIGHT",self,"TOPLEFT",x-6,-6) else c.total:SetPoint("TOPLEFT",x+6,-6) end
         c.total:SetText("Total "..F.Money(v.total)); c.total:Show(); c.totalBack:Show()
         c.hover:SetText(date("%d %b %H:%M",point.time).."   Gold "..F.Money(v.gold).."   Other assets "..F.Money(v.assets).."   Equipped Gear "..F.Money(v.equipped))
-        local tip=line and tostring(point.time)..line or ""
+        local tip=line and "line"..point.time..line or area and "area"..point.time..area or ""
         if tip~=c.tip then
             c.tip=tip
-            if line then showBand(self,point,line,c) elseif GameTooltip:IsOwned(self) then GameTooltip:Hide() end
+            if line then showBand(self,point,line,c)
+            elseif area then showArea(self,point,area)
+            elseif GameTooltip:IsOwned(self) then GameTooltip:Hide() end
         end
     end)
 end

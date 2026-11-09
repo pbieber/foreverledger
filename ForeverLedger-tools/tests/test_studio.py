@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -238,12 +239,17 @@ class VisualsStoreTests(StudioTestCase):
                                     "place": "right", "sell": True, "ilvl": True})
         self.assertEqual((saved[1]["place"], saved[1]["sell"], saved[1]["copper"]), ("below", False, 15000000))
 
+    def test_a_card_without_an_item_is_the_gold_amount_alone(self):
+        store.update_episode(self.db, self.episode, {"visuals": [{"key": "g", "item_id": None, "name": "", "copper": 52000}]})
+        saved = store.get_episode(self.db, self.episode)["visuals"][0]
+        self.assertEqual((saved["item_id"], saved["name"], saved["copper"]), (None, "", 52000))
+
     def test_a_new_episode_has_no_cards(self):
         self.assertEqual(store.get_episode(self.db, self.episode)["visuals"], [])
 
     def test_bad_cards_are_refused(self):
         good = {"key": "a", "item_id": 1, "name": "x", "copper": 5}
-        for bad in ({}, [dict(good, item_id=0)], [dict(good, item_id=True)], [dict(good, copper=1.5)],
+        for bad in ({}, [dict(good, item_id=0)], [dict(good, item_id=True)], [dict(good, item_id="1")], [dict(good, copper=1.5)],
                     [dict(good, copper=10 ** 15)], [dict(good, key="")], [dict(good, place="left")],
                     [dict(good, sell="no")], [good, good], [good] * 101, ["card"]):
             with self.assertRaises(store.Invalid, msg=bad):
@@ -358,8 +364,14 @@ class IconTests(StudioTestCase):
         self.requests.append(url)
         for fragment, reply in self.replies.items():
             if fragment in url:
+                if isinstance(reply, Exception):
+                    raise reply
                 return reply
         raise OSError("unexpected request")
+
+    @staticmethod
+    def not_found(url="https://nether.wowhead.com/"):
+        return urllib.error.HTTPError(url, 404, "Not Found", {}, None)
 
     def store(self, **options):
         return icons.IconStore(self.folder / "cache", self.pugger, fetch=self.fetch, **options)
@@ -368,12 +380,64 @@ class IconTests(StudioTestCase):
     def rows(name="Iron Bar", item_id=None):
         return [{"name": name, "item_id": item_id}]
 
-    def test_pugger_item_by_name_needs_no_network(self):
+    def test_pugger_item_by_name_is_used_offline(self):
         (self.pugger / "items" / "adepts-elixir.png").write_bytes(PNG)
         rows = self.rows("Adept's Elixir")
-        self.store().attach(rows, "tbc")
+        self.store(online=False).attach(rows, "tbc")
         self.assertEqual(rows[0]["icon"], "data:image/png;base64," + base64.b64encode(PNG).decode())
         self.assertEqual(self.requests, [])
+
+    def test_pugger_item_by_name_is_used_when_wowhead_does_not_know_the_item(self):
+        (self.pugger / "items" / "adepts-elixir.png").write_bytes(PNG)
+        self.replies["search"] = json.dumps({"results": []}).encode()
+        rows = self.rows("Adept's Elixir")
+        self.store().attach(rows, "tbc")
+        self.assertTrue(rows[0]["icon"].startswith("data:image/png"))
+
+    def test_wowheads_icon_wins_over_a_pugger_picture_with_the_same_name(self):
+        (self.pugger / "items" / "elixir-of-minor-agility.png").write_bytes(PNG)
+        self.replies["tbc/tooltip/item/2457"] = json.dumps({"icon": "inv_potion_91"}).encode()
+        self.replies["large/inv_potion_91.jpg"] = JPEG
+        rows = self.rows("Elixir of Minor Agility", 2457)
+        self.store().attach(rows, "tbc")
+        self.assertTrue(rows[0]["icon"].startswith("data:image/jpeg"))
+
+    def test_a_picture_matched_by_name_is_checked_again_online(self):
+        (self.pugger / "items" / "elixir-of-minor-agility.png").write_bytes(PNG)
+        self.store(online=False).attach(self.rows("Elixir of Minor Agility", 2457), "forever")
+        self.replies["forever/tooltip/item/2457"] = json.dumps({"icon": "inv_potion_91"}).encode()
+        self.replies["large/inv_potion_91.jpg"] = JPEG
+        rows = self.rows("Elixir of Minor Agility", 2457)
+        self.store().attach(rows, "forever")
+        self.assertTrue(rows[0]["icon"].startswith("data:image/jpeg"))
+
+    def test_an_item_id_is_looked_up_in_the_sources_own_section(self):
+        self.replies["forever/tooltip/item/249409"] = json.dumps({"icon": "inv_inscription_inkcerulean01"}).encode()
+        self.replies["large/inv_inscription_inkcerulean01.jpg"] = JPEG
+        rows = self.rows("Cerulean Dye", 249409)
+        self.store().attach(rows, "forever")
+        self.assertTrue(rows[0]["icon"].startswith("data:image/jpeg"))
+        self.assertEqual(self.requests[0], "https://nether.wowhead.com/forever/tooltip/item/249409")
+
+    def test_an_id_wowhead_does_not_have_falls_back_to_the_name_and_is_no_network_failure(self):
+        self.replies["tooltip/item/249410"] = self.not_found()
+        self.replies["forever/search"] = json.dumps({"results": [
+            {"type": 3, "name": "Sulfuric Acid", "icon": "trade_alchemy"}]}).encode()
+        self.replies["large/trade_alchemy.jpg"] = JPEG
+        icon_store = self.store()
+        rows = self.rows("Sulfuric Acid", 249410)
+        icon_store.attach(rows, "forever")
+        self.assertTrue(rows[0]["icon"].startswith("data:image/jpeg"))
+        self.assertEqual(icon_store.offline_until, 0)
+
+    def test_an_icon_wowhead_cannot_supply_is_not_found_rather_than_offline(self):
+        self.replies["tooltip"] = json.dumps({"icon": "inv_gone"}).encode()
+        self.replies["large/inv_gone.jpg"] = self.not_found()
+        icon_store = self.store()
+        rows = self.rows("Gone", 1)
+        icon_store.attach(rows, "forever")
+        self.assertIsNone(rows[0]["icon"])
+        self.assertEqual(icon_store.offline_until, 0)
 
     def test_item_id_names_the_icon_and_pugger_supplies_it_whatever_its_case(self):
         (self.pugger / "allwow" / "INV_Ingot_02.png").write_bytes(PNG)
@@ -394,10 +458,12 @@ class IconTests(StudioTestCase):
         self.assertTrue(rows[0]["icon"].startswith("data:image/jpeg"))
 
     def test_found_icons_are_remembered_across_restarts(self):
-        (self.pugger / "items" / "iron-bar.png").write_bytes(PNG)
-        self.store().attach(self.rows(), "tbc")
-        (self.pugger / "items" / "iron-bar.png").unlink()
-        rows = self.rows()
+        (self.pugger / "allwow" / "inv_ingot_iron.png").write_bytes(PNG)
+        self.replies["tooltip/item/3575"] = json.dumps({"icon": "inv_ingot_iron"}).encode()
+        self.store().attach(self.rows("Iron Bar", 3575), "tbc")
+        (self.pugger / "allwow" / "inv_ingot_iron.png").unlink()
+        self.requests.clear()
+        rows = self.rows("Iron Bar", 3575)
         self.store().attach(rows, "tbc")
         self.assertIsNotNone(rows[0]["icon"])
         self.assertEqual(self.requests, [])
@@ -611,6 +677,35 @@ class WindowTests(StudioTestCase):
         self.addCleanup(db.close)
         window = analytics.resolve_window(db, "marker:Day 1")
         self.assertEqual((window["start"], window["end"]), (1000, 3000))
+
+    def test_a_marker_taken_over_from_the_linked_account_counts_from_its_start_there(self):
+        e = Events()
+        e.add("episode_start", {"name": "Day 1"}, 1000)
+        e.add("episode_start", {"name": "Day 2"}, 2000)
+        e.add("logout", {}, 3000)
+        # The other account was offline at 2000 and took Day 2 over when it came back.
+        e.add("episode_start", {"name": "Day 1", "occurredAt": 1000}, 1000, source="Other:1:1")
+        e.add("episode_start", {"name": "Day 2", "occurredAt": 2000}, 2600, source="Other:1:1")
+        e.add("highlight", {}, 2700, character=(BANK_GUID, "Bank-Realm"), source="Other:1:1")
+        e.add("logout", {}, 2900, source="Other:1:1")
+        db = e.database(self.folder)
+        self.addCleanup(db.close)
+        windows = {w["id"]: w for w in analytics.windows(db)}
+        self.assertEqual((windows["marker:Day 1"]["start"], windows["marker:Day 1"]["end"]), (1000, 2000))
+        self.assertEqual((windows["marker:Day 2"]["start"], windows["marker:Day 2"]["end"]), (2000, 3000))
+        (found,) = analytics.highlights(db, windows["marker:Day 2"])
+        self.assertEqual((found["marker"], found["since"], found["number"]), ("Day 2", 700, 1))
+
+    def test_the_same_marker_started_again_keeps_the_earlier_start_for_highlights(self):
+        e = Events()
+        e.add("episode_start", {"name": "Day 1"}, 1100)
+        e.add("highlight", {}, 1150)
+        e.add("episode_start", {"name": "Day 1", "occurredAt": 1000}, 1200)
+        e.add("highlight", {}, 1300)
+        db = e.database(self.folder)
+        self.addCleanup(db.close)
+        found = analytics.highlights(db, analytics.resolve_window(db, "all"))
+        self.assertEqual([(h["number"], h["since"]) for h in found], [(1, 50), (2, 300)])
 
     def test_unknown_window_is_reported(self):
         e = Events()
@@ -966,7 +1061,7 @@ class CostFigureTests(StudioTestCase):
         db = e.database(self.folder)
         self.addCleanup(db.close)
         losses = analytics._lost_listing_fees(db, analytics._activities(db))
-        self.assertEqual(losses, [(1300, 148, GUID)])
+        self.assertEqual(losses, [(1300, 148, GUID, self.LEGS, 1)])
 
     def test_a_sale_linked_to_its_auction_refunds_only_that_auction(self):
         e = Events()
@@ -1318,6 +1413,25 @@ class ItemAnalysisTests(StudioTestCase):
         self.assertEqual(found["recipe"]["reagents"][0]["unit_cost"], 50)
         self.assertEqual(found["spent"]["materials"], 100)
 
+    def test_units_used_to_craft_other_items_come_off_what_was_spent(self):
+        e = Events()
+        e.activity("auction_purchase", -1000, 1050, item={"id": 2, "name": "Bar"}, quantity=10)
+        self.craft(e, 1100, 2, {BAR[0]: 10}, {BAR[0]: 4, CHAIN[0]: 2})  # Six bars into two chains.
+        e.activity("vendor_sale", 50, 1300, item={"id": 2, "name": "Bar"}, quantity=1)
+        found = self.analyse(e, "Bar")
+        self.assertEqual(found["used"], {"units": 6, "value": 600, "credited": 600, "unpriced": False,
+                                         "into": [{"name": "Chain", "units": 6}]})
+        self.assertEqual((found["spent"]["used_in_crafts"], found["spent"]["total"], found["net"]), (600, 400, 50 - 400))
+        # The chains count those bars as their materials.
+        self.assertEqual(self.analyse(e, "Chain")["spent"]["materials"], 600)
+
+    def test_units_used_never_take_off_more_than_was_spent_in_the_span(self):
+        e = Events()
+        e.activity("auction_purchase", -1000, 900, item={"id": 2, "name": "Bar"}, quantity=10)  # Before the span.
+        self.craft(e, 1100, 2, {BAR[0]: 10}, {BAR[0]: 4, CHAIN[0]: 2})
+        found = self.analyse(e, "Bar")
+        self.assertEqual((found["used"]["value"], found["used"]["credited"], found["net"]), (600, 0, 0))
+
     def test_a_material_with_no_cost_on_record_is_flagged(self):
         e = Events()
         self.craft(e, 1100, 1, {BAR[0]: 10}, {BAR[0]: 7, CHAIN[0]: 1})
@@ -1347,6 +1461,134 @@ class ItemAnalysisTests(StudioTestCase):
         self.assertEqual([c["name"] for c in result["choices"]], ["Chain", "Bar", "Ore"])
         self.assertEqual(result["item"]["name"], "Chain")
         self.assertFalse(analytics.item_figure(db, self.WINDOW, "Thread")["item"]["has_activity"])
+
+
+class ItemComparisonTests(StudioTestCase):
+    WINDOW = {"start": 1000, "end": 2000}
+    CHAIN = {"id": 9, "name": "Chain"}
+
+    def ledger(self, e):
+        db = e.database(self.folder)
+        self.addCleanup(db.close)
+        return db
+
+    def compare(self, e, name="Chain"):
+        return analytics.ItemLedger(self.ledger(e)).compare(name, self.WINDOW["start"], self.WINDOW["end"])
+
+    def post(self, e, key, at, quantity, deposit, total):
+        e.add("auction_posted", {"key": key, "character": GUID, "item": self.CHAIN, "quantity": quantity,
+                                 "totalPrice": total, "deposit": deposit}, at)
+        e.activity("auction_deposit", -deposit, at, item=self.CHAIN, auctionKey=key)
+
+    def sell(self, e, at, quantity, gross, refund):
+        e.activity("auction_sale", gross - gross // 20 + refund, at, item=self.CHAIN, quantity=quantity,
+                   gross=gross, commission=gross // 20, depositRefund=refund)
+
+    def test_a_partly_sold_listing_counts_the_units_that_came_back_and_their_deposit(self):
+        e = Events()
+        e.activity("auction_purchase", -1000, 1050, item=self.CHAIN, quantity=10)
+        self.post(e, "P:1", 1100, quantity=4, deposit=40, total=1200)
+        # Forever reports a commodity that partly sold as cancelled, losing its whole deposit.
+        e.add("auction_outcome", {"auctionKey": "P:1", "outcome": "cancelled", "confidence": "server_id",
+                                  "depositLost": 40}, 1300)
+        self.sell(e, 1600, quantity=1, gross=300, refund=10)
+        row = self.compare(e)
+        self.assertEqual((row["sold"], row["each"], row["unit_cost"], row["margin"]), (1, 285, 100, 185))
+        self.assertAlmostEqual(row["margin_share"], 1.85)
+        self.assertEqual((row["listed"], row["unsold"], row["unsold_units"], row["listing_fees"]), (1, 1, 3, 30))
+        self.assertAlmostEqual(row["sales_rate"], 0.25)
+        self.assertEqual(row["net"], 285 - 1000 - 30)
+        # The nine still held cost 900 of that, so selling one made a profit.
+        self.assertEqual(row["profit_sold"], 285 - 100 - 30)
+        self.assertEqual((row["stock"], row["stock_value"]), (None, None))
+
+    def test_stock_is_each_characters_latest_bags_bank_mail_and_auctions_up(self):
+        e = Events()
+        alt = (BANK_GUID, "Alt-Realm")
+        e.activity("auction_purchase", -2000, 1050, item=self.CHAIN, quantity=20)
+        chain = {"id": 9}  # As a TBC snapshot has it: no name.
+        e.add("snapshot", {"location": "bags", "rows": [{"item": chain, "quantity": 5}]}, 1100)
+        e.add("snapshot", {"location": "bags", "rows": [{"item": chain, "quantity": 3}]}, 1200)
+        e.add("snapshot", {"location": "equipment", "rows": [{"item": chain, "quantity": 1}]}, 1200)
+        e.add("snapshot", {"location": "mail", "rows": [{"items": [{"item": chain, "quantity": 2}]}]}, 1300)
+        e.add("snapshot", {"location": "auctions", "rows": [{"item": chain, "quantity": 4, "status": 0},
+                                                            {"item": chain, "quantity": 9, "status": 1}]}, 1400)
+        e.add("snapshot", {"location": "bank", "rows": [{"item": chain, "quantity": 10}]}, 1500, character=alt)
+        e.add("snapshot", {"location": "bank", "rows": [{"item": chain, "quantity": 50}]}, 2500, character=alt)
+        row = self.compare(e)
+        self.assertEqual(row["stock_places"], {"bags": 3, "bank": 10, "mail": 2, "auctions": 4})
+        self.assertEqual((row["stock"], row["stock_value"]), (19, 1900))
+        self.assertEqual(self.compare(e, "Ore")["stock_places"], {})
+
+    def test_the_item_analysis_counts_deposits_kept_on_unsold_listings_as_spent(self):
+        e = Events()
+        e.activity("auction_deposit", -60, 1100, item=self.CHAIN, quantity=5)
+        e.add("auction_return", {"item": self.CHAIN, "quantity": 5, "failure": "expired"}, 1500)
+        e.activity("auction_deposit", -60, 1600, item=self.CHAIN, quantity=5)  # Still up.
+        found = analytics.ItemLedger(self.ledger(e)).analyse("Chain", 1000, 2000)
+        self.assertEqual((found["spent"]["listing_fees"], found["spent"]["total"], found["net"]), (60, 60, -60))
+        self.assertEqual(found["listings"], {"listed": 2, "unsold": 1, "unsold_units": 5, "unknown_units": 0, "unpriced": 0})
+
+    def test_figures_that_cannot_be_worked_out_are_none(self):
+        e = Events()
+        e.activity("vendor_sale", 40, 1300, item=self.CHAIN, quantity=4)  # Never gained, never listed.
+        row = self.compare(e)
+        self.assertEqual((row["each"], row["unit_cost"], row["margin"], row["margin_share"], row["sales_rate"]),
+                         (10, None, None, None, None))
+
+    def test_an_item_that_cost_nothing_has_a_margin_but_no_share_of_its_cost(self):
+        farmed = Events()
+        farmed.add("loot_message", {"text": "You receive loot: " + link(9, "Chain", 3)}, 1100)
+        self.sell(farmed, 1200, quantity=1, gross=100, refund=0)
+        row = self.compare(farmed)
+        self.assertEqual((row["unit_cost"], row["margin"], row["margin_share"], row["sales_rate"]), (0, 95, None, 1.0))
+
+    def test_the_best_sellers_are_compared_until_items_are_chosen(self):
+        e = Events()
+        for at, (item_id, name), gross in ((1100, (1, "Ore"), 50), (1200, (2, "Bar"), 500), (1300, (9, "Chain"), 900),
+                                           (1400, (3, "Thread"), 10)):
+            e.activity("auction_sale", gross, at, item={"id": item_id, "name": name}, quantity=1, gross=gross)
+        db = self.ledger(e)
+        names = lambda result: [row["name"] for row in result["items"]]  # noqa: E731
+        self.assertEqual(names(analytics.compare_figure(db, self.WINDOW)), ["Chain", "Bar", "Ore"])
+        self.assertEqual(names(analytics.compare_figure(db, self.WINDOW, ["Thread", "", "Ore", "Thread"])), ["Thread", "Ore"])
+        self.assertEqual(names(analytics.compare_figure(db, self.WINDOW, [])), [])
+        many = analytics.compare_figure(db, self.WINDOW, [f"Item {i}" for i in range(10)])
+        self.assertEqual(len(many["items"]), analytics.MAX_COMPARED_ITEMS)
+
+    def test_top_items_rank_sales_profit_and_loss(self):
+        e = Events()
+        ore, bar, thread = {"id": 1, "name": "Ore"}, {"id": 2, "name": "Bar"}, {"id": 3, "name": "Thread"}
+        e.activity("auction_purchase", -800, 1050, item=bar, quantity=1)
+        e.activity("auction_purchase", -100, 1060, item=thread, quantity=5)
+        for at, item, units, gross in ((1100, ore, 5, 50), (1200, bar, 1, 500), (1300, self.CHAIN, 2, 900),
+                                       (1400, {"id": 4, "name": "Gem"}, 2, 400)):
+            e.activity("auction_sale", gross, at, item=item, quantity=units, gross=gross)
+        e.activity("auction_sale", 5000, 2500, item=bar, quantity=50, gross=5000)  # After the window.
+        db = self.ledger(e)
+        top = analytics.top_items(db, self.WINDOW)
+        pairs = lambda rows, key: [(row["name"], row[key]) for row in rows]  # noqa: E731
+        # Most units first; the same number of units goes by what they brought in.
+        self.assertEqual(pairs(top["sales"], "sold"), [("Ore", 5), ("Chain", 2), ("Gem", 2), ("Bar", 1)])
+        self.assertEqual(top["sales"][1]["revenue"], 900)
+        self.assertEqual(pairs(top["profit"], "net"), [("Chain", 900), ("Gem", 400), ("Ore", 50)])
+        self.assertEqual(pairs(top["loss"], "net"), [("Bar", -300), ("Thread", -100)])
+        self.assertEqual(top["loss"][0]["item_id"], 2)
+        self.assertEqual([len(top[k]) for k in ("sales", "profit", "loss")], [4, 3, 2])
+        self.assertEqual(len(analytics.top_items(db, self.WINDOW, limit=1)["sales"]), 1)
+
+    def test_the_chosen_items_are_kept_with_the_episode(self):
+        db = store.connect(self.folder / "plan.sqlite")
+        self.addCleanup(db.close)
+        episode = store.add_episode(db, store.add_series(db, "Series", "short"))
+        settings = {"item": {"view": "compare"}, "compare": {"names": ["Chain", "Ore", "Chain"], "seconds": 4}}
+        store.update_episode(db, episode, {"chart_settings": settings})
+        saved = store.get_episode(db, episode)["chart_settings"]
+        self.assertEqual((saved["item"]["view"], saved["compare"]["names"]), ("compare", ["Chain", "Ore"]))
+        for bad in ({"compare": {"names": "Chain"}}, {"compare": {"names": [""]}}, {"item": {"view": "both"}},
+                    {"compare": {"names": [f"Item {i}" for i in range(7)]}}):
+            with self.assertRaises(store.Invalid, msg=bad):
+                store.update_episode(db, episode, {"chart_settings": bad})
 
 
 class MockDataTests(StudioTestCase):
@@ -1451,6 +1693,15 @@ class ServerTests(StudioTestCase):
         self.assertTrue(all("icon" in r for r in bag["item"]["recipe"]["reagents"]))
         self.assertEqual(self.api("GET", "/api/data/tbc/item"), {"empty": True})
 
+    def test_comparison_shows_the_best_sellers_or_the_chosen_items_with_icons(self):
+        result = self.api("GET", "/api/data/mock/compare?window=all")
+        self.assertEqual([r["name"] for r in result["items"]], [c["name"] for c in result["choices"][:3]])
+        self.assertTrue(all("icon" in r for r in result["items"]))
+        chosen = self.api("GET", "/api/data/mock/compare?window=all&chosen=1&name=Linen%20Bag")
+        self.assertEqual([r["name"] for r in chosen["items"]], ["Linen Bag"])
+        self.assertEqual(self.api("GET", "/api/data/mock/compare?window=all&chosen=1")["items"], [])
+        self.assertEqual(self.api("GET", "/api/data/tbc/compare"), {"empty": True})
+
     def test_sources_stay_separate(self):
         mock = self.api("GET", "/api/data/mock/figures?window=all&range=to_date")
         self.assertGreater(mock["value"]["last"], 0)
@@ -1535,6 +1786,19 @@ class ServerTests(StudioTestCase):
         for bad in ("id=x", "id=0", ""):
             self.assertEqual(self.request("GET", f"/api/visual/tbc/item?{bad}")[0], 400)
         self.assertEqual(self.request("GET", "/api/visual/nope/item?id=1")[0], 404)
+
+    def test_visual_top_items_come_with_icons_and_fall_back_to_all_history(self):
+        self.assertEqual(self.api("GET", "/api/visual/tbc/top"), {"empty": True})
+        e = Events()
+        e.activity("auction_sale", 900, 110, item={"id": 4238, "name": "Linen Bag"}, quantity=1, gross=900)
+        path = self.folder / "account.json"
+        path.write_text(json.dumps({"schema": 1, "sourceID": SOURCE, "events": e.events}), encoding="utf-8")
+        self.assertTrue(self.app.import_path("tbc", str(path))["ok"])
+        top =self.api("GET", "/api/visual/tbc/top?window=marker:Gone")
+        self.assertEqual(top["window"]["id"], "all")
+        self.assertEqual([row["name"] for row in top["sales"]], ["Linen Bag"])
+        self.assertIn("icon", top["sales"][0])
+        self.assertEqual(top["loss"], [])
 
     def test_episode_round_trip(self):
         series = self.api("POST", "/api/series", {"name": "New", "format": "long"})["id"]

@@ -28,10 +28,14 @@ function F.Highlights(first,last,characters)
     end
     local list,counts,marker={},{},nil
     for _,e in ipairs(F.db.events) do
-        if e.kind=="episode_start" then marker={name=e.data.name,time=e.time}
+        if e.kind=="episode_start" then
+            -- A linked account's earlier start of the running marker moves its start back.
+            local time=F.EventTime(e)
+            if marker and marker.name==e.data.name then marker.time=math.min(marker.time,time)
+            else marker={name=e.data.name,time=time,group="marker:"..e.id} end
         elseif e.kind=="episode_end" then marker=nil
         elseif e.kind=="highlight" and not removed[e.id] then
-            local group=marker and "marker:"..marker.time or "day:"..date("%Y-%m-%d",e.time)
+            local group=marker and marker.group or "day:"..date("%Y-%m-%d",e.time)
             counts[group]=(counts[group] or 0)+1
             if (not first or e.time>=first) and (not last or e.time<=last) and (not characters or characters[e.character]) then
                 list[#list+1]={id=e.id,time=e.time,number=counts[group],note=e.data.note,zone=e.data.zone,

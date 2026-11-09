@@ -1,7 +1,9 @@
 """Item icons for the charts, kept in a local cache so each is only found once.
 
-An icon comes from Pugger's folders when it has one, otherwise Wowhead names and
-supplies it. Only item IDs and names are sent, and any failure leaves a blank slot.
+Wowhead names an item's icon, in the source's own section, and Pugger's icon folder or
+Wowhead supplies the picture. Pugger's pictures matched only by item name can show
+another item, so they stand in when Wowhead can't answer and are checked again later.
+Only item IDs and names are sent, and any failure leaves a blank slot.
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ import re
 import shutil
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -35,6 +38,11 @@ def _mime(data):
     if data.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
     return None
+
+
+def _not_found(err):
+    """Wowhead answers 404 for an item or icon it doesn't have. That isn't a network failure."""
+    return isinstance(err, urllib.error.HTTPError) and err.code == 404
 
 
 def slug(name):
@@ -87,11 +95,21 @@ class IconStore:
         return self._pugger_names.get(icon.casefold())
 
     def _icon_name_online(self, name, item_id, source):
-        """Wowhead's name for this item's icon. Network errors propagate to the caller."""
-        if item_id:
-            data = json.loads(self.fetch(f"https://nether.wowhead.com/tooltip/item/{int(item_id)}"))
-            return data.get("icon")
+        """Wowhead's name for this item's icon. Network errors propagate to the caller.
+
+        New Forever items exist only in Forever's section, and older items can have
+        another icon in retail, so the ID is looked up in the source's section.
+        """
         section = WOWHEAD_SECTION.get(source, "forever")
+        if item_id:
+            try:
+                data = json.loads(self.fetch(f"https://nether.wowhead.com/{section}/tooltip/item/{int(item_id)}"))
+            except urllib.error.HTTPError as err:
+                if not _not_found(err):
+                    raise
+                data = None
+            if isinstance(data, dict) and data.get("icon"):
+                return data["icon"]
         query = urllib.parse.quote_plus(name)
         data = json.loads(self.fetch(f"https://www.wowhead.com/{section}/search/suggestions-template?q={query}"))
         for result in data.get("results", []):
@@ -116,25 +134,40 @@ class IconStore:
     def _find(self, name, item_id, source, deadline, icon_name=None):
         key = name.casefold()
         entry = self.index.get(key, {})
-        if entry.get("file"):
+        # An entry with an icon name came from Wowhead. One without was matched by item
+        # name, by Pugger or an earlier version, and is only kept until Wowhead answers.
+        if entry.get("file") and entry.get("icon"):
             found = self._as_data_uri(entry["file"])
             if found:
                 return found
-        filename = self._from_pugger_items(name)
-        if not filename:
-            now = time.time()
-            if (not self.online or now < self.offline_until or now > deadline or
-                    (entry.get("missing_until", 0) > now and not icon_name)):
-                return None
+        now = time.time()
+        waiting = max(entry.get("missing_until", 0), entry.get("retry_after", 0)) > now and not icon_name
+        ask = self.online and self.offline_until <= now <= deadline and not waiting
+        icon = filename = None
+        answered = False
+        if ask:
             try:
                 icon = icon_name or self._icon_name_online(name, item_id, source)
                 filename = self._file_for_icon(icon) if isinstance(icon, str) else None
-            except OSError:  # Includes every network failure: try again in a few minutes.
-                self.offline_until = time.time() + OFFLINE_RETRY
-                return None
+                answered = True
+            except OSError as err:  # Includes every network failure: try again in a few minutes.
+                if _not_found(err):
+                    answered = True
+                else:
+                    self.offline_until = time.time() + OFFLINE_RETRY
             except (ValueError, TypeError):  # An unexpected reply counts as not found.
-                filename = None
-        self.index[key] = {"file": filename} if filename else {"missing_until": time.time() + NOT_FOUND_RETRY}
+                answered = True
+        if filename:
+            self.index[key] = {"file": filename, "icon": icon}
+        else:
+            kept = entry.get("file")
+            filename = kept if kept and (self.folder / Path(kept).name).is_file() else self._from_pugger_items(name)
+            if filename:
+                self.index[key] = {"file": filename, **({"retry_after": now + NOT_FOUND_RETRY} if answered else {})}
+            elif answered:
+                self.index[key] = {"missing_until": now + NOT_FOUND_RETRY}
+            else:
+                return None
         self._save()
         return self._as_data_uri(filename) if filename else None
 

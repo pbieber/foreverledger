@@ -143,8 +143,8 @@ function measureValue(context, copper) {
   const parts = valueParts(copper);
   const coinSize = L.value * L.coin;
   context.font = fontFor(L.value, true);
-  const sign = copper > 0 ? "+" : "−";
-  const signWidth = context.measureText(sign).width + 2;
+  const sign = copper > 0 ? "+" : copper < 0 ? "−" : "";
+  const signWidth = sign ? context.measureText(sign).width + 2 : 0;
   const pieces = parts.map((p) => ({ ...p, width: context.measureText(p.text).width }));
   const width = signWidth + pieces.reduce((sum, p) => sum + p.width + 3 + coinSize, 0) + (pieces.length - 1) * 7;
   return { sign, signWidth, pieces, coinSize, width: width + L.valuePadX * 2, height: L.value + L.valuePadY * 2 };
@@ -155,11 +155,12 @@ async function drawValue(context, copper, value, x, y) {
   const baseline = y + L.valuePadY + L.value * 0.84;
   let at = x + L.valuePadX;
   context.font = fontFor(L.value, true);
-  context.fillStyle = copper > 0 ? GAIN : LOSS;
+  const color = copper > 0 ? GAIN : copper < 0 ? LOSS : "#ffffff";
+  context.fillStyle = color;
   context.fillText(value.sign, at, baseline);
   at += value.signWidth;
   for (const piece of value.pieces) {
-    context.fillStyle = copper > 0 ? GAIN : LOSS;
+    context.fillStyle = color;
     context.fillText(piece.text, at, baseline);
     at += piece.width + 3;
     const coin = await loadImage(COINS[piece.coin]);
@@ -169,9 +170,19 @@ async function drawValue(context, copper, value, x, y) {
 }
 
 // Draws the card onto a new canvas at `scale` (1 is the size of the game's tooltip).
+// Without an item, the card is the gold amount alone.
 export async function drawVisual(item, visual, scale = 1) {
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d");
+  if (!item) {
+    const value = measureValue(context, visual.copper);
+    canvas.width = Math.ceil((value.width + L.margin * 2) * scale);
+    canvas.height = Math.ceil((value.height + L.margin * 2) * scale);
+    context.scale(scale, scale);
+    context.textBaseline = "alphabetic";
+    await drawValue(context, visual.copper, value, L.margin, L.margin);
+    return canvas;
+  }
   const box = layout(context, item, visual);
   const tipWidth = box.inner + L.padX * 2, tipHeight = box.height + L.padY * 2;
   const value = visual.copper ? measureValue(context, visual.copper) : null;

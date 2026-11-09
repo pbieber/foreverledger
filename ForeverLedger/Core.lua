@@ -130,6 +130,15 @@ function F.Init(db, identity)
     db.owners, db.settings = db.owners or {}, db.settings or {}
     db.peers = db.peers or {}
     db.settings.commissionBps = db.settings.commissionBps or 500
+    -- When the running marker began, or the last one ended; 0 if there never was one.
+    -- Linked accounts compare it to agree on one marker.
+    if db.markerAt == nil then
+        db.markerAt = 0
+        for i = #db.events, 1, -1 do
+            local e = db.events[i]
+            if e.kind == "episode_start" or e.kind == "episode_end" then db.markerAt = F.EventTime(e); break end
+        end
+    end
     F.db, F.identity = db, identity
     F.baselined, F.session = false, nil
     db.owners[identity.name] = true
@@ -142,6 +151,7 @@ function F.Init(db, identity)
     F.session = F.Emit("session", {version=F.VERSION, build=identity.build}).id
     F.RepairLogoutBalances()
     if F.BackfillMail then F.BackfillMail() end
+    if F.RepairVendorSales then F.RepairVendorSales() end
     if F.RepairPostage then F.RepairPostage() end
     if F.RepairPeerHistory then F.RepairPeerHistory() end
     if F.InitValuation then F.InitValuation() end

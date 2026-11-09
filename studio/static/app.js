@@ -1,4 +1,4 @@
-import { attachHover, breakdownGroups, CHARTS, createFrames, exportPng, formatTime, moneyNode, renderForScreen, renderVideo, saveBlob, tableFor, VIDEO_HOLD_SECONDS, VideoCancelled } from "./charts.js";
+import { attachHover, breakdownGroups, CHARTS, createFrames, exportPng, formatTime, moneyNode, moneyWords, renderForScreen, renderVideo, saveBlob, tableFor, VIDEO_HOLD_SECONDS, VideoCancelled } from "./charts.js";
 import { COINS } from "./coins.js";
 import { drawVisual, QUALITY_COLORS, shownLines, valueWords, visualBlob } from "./visuals.js";
 
@@ -616,7 +616,8 @@ async function renderData(pane, episode) {
           if (episode.source === id) return;
           // Windows and items belong to one source, so a new source starts afresh.
           const { name, ...item } = episode.chart_settings.item ?? {};
-          const chart_settings = name === undefined ? episode.chart_settings : { ...episode.chart_settings, item };
+          const { names, ...compare } = episode.chart_settings.compare ?? {};
+          const chart_settings = { ...episode.chart_settings, ...(name === undefined ? {} : { item }), ...(names === undefined ? {} : { compare }) };
           await patch({ source: id, window: "all", chart_settings });
           await draw();
         } }, text))),
@@ -670,22 +671,52 @@ function choiceLabel(choice) {
   const parts = [["sold", choice.sold], ["farmed", choice.farmed], ["crafted", choice.crafted], ["bought", choice.bought]]
     .filter(([, count]) => count).map(([word, count]) => `${word} ${count.toLocaleString("en-US")}`);
   if (!choice.bought && choice.purchases) parts.push("bought");
+  if (!parts.length && choice.listed) parts.push(`listed ${choice.listed.toLocaleString("en-US")}`);
   return parts.length ? `${choice.name}  ·  ${parts.join(", ")}` : choice.name;
 }
 
-// One item at a time, chosen per episode. Items are listed by what they sold for.
+// Changes one chart's saved settings, keeping the rest.
+function saveChartSetting(episode, kind, changes) {
+  const settings = episode.chart_settings;
+  episode.chart_settings = { ...settings, [kind]: { ...(settings[kind] ?? {}), ...changes } };
+  saveLater(`charts-${episode.id}`, () => api("PATCH", `/api/episodes/${episode.id}`, { chart_settings: episode.chart_settings }));
+}
+
+// One item analysed, or several compared side by side, chosen per episode.
 function itemSection(episode, ctx) {
-  const picker = h("select", { class: "item-select", "aria-label": "Item to analyse", disabled: true });
+  const controls = h("div", { class: "item-controls" });
   const body = h("div");
+  const view = () => episode.chart_settings.item?.view ?? "one";
+  const viewButtons = [["one", "One item"], ["compare", "Compare items"]].map(([id, text]) => h("button", { onclick: () => {
+    if (view() === id) return;
+    saveChartSetting(episode, "item", { view: id });
+    show();
+  } }, text));
   const section = h("section", { class: "item-section", "aria-label": "Item analysis" },
-    h("div", { class: "filters item-picker" }, h("h2", {}, "Item analysis"), h("span", { class: "filter-label" }, "Item"), picker), body);
+    h("div", { class: "filters item-picker" }, h("h2", {}, "Item analysis"),
+      h("div", { class: "segmented", role: "group", "aria-label": "Item view" }, viewButtons), controls), body);
+
+  function show() {
+    viewButtons.forEach((button, i) => button.setAttribute("aria-pressed", String((i === 1) === (view() === "compare"))));
+    controls.replaceChildren();
+    body.replaceChildren();
+    (view() === "compare" ? compareItems : oneItem)(episode, ctx, section, controls, body);
+  }
+  show();
+  return section;
+}
+
+// One item at a time. Items are listed by what they sold for.
+function oneItem(episode, ctx, section, controls, body) {
+  const picker = h("select", { class: "item-select", "aria-label": "Item to analyse", disabled: true });
+  controls.replaceChildren(h("span", { class: "filter-label" }, "Item"), picker);
 
   async function load(name) {
     section.classList.add("loading");
     const query = `window=${encodeURIComponent(episode.window)}&name=${encodeURIComponent(name || "")}`;
     const result = await attempt(() => api("GET", `/api/data/${episode.source}/item?${query}`));
     section.classList.remove("loading");
-    if (!result || result.empty) return;
+    if (!result || result.empty || !picker.isConnected) return;
     const chosen = result.item?.name;
     const options = result.choices.map((choice) => h("option", { value: choice.name, selected: choice.name === chosen }, choiceLabel(choice)));
     if (chosen && !result.choices.some((choice) => choice.name === chosen)) {
@@ -699,13 +730,57 @@ function itemSection(episode, ctx) {
   }
 
   picker.addEventListener("change", () => {
-    const settings = episode.chart_settings;
-    episode.chart_settings = { ...settings, item: { ...(settings.item ?? {}), name: picker.value } };
-    saveLater(`charts-${episode.id}`, () => api("PATCH", `/api/episodes/${episode.id}`, { chart_settings: episode.chart_settings }));
+    saveChartSetting(episode, "item", { name: picker.value });
     load(picker.value);
   });
   load(episode.chart_settings.item?.name);
-  return section;
+}
+
+// Several items side by side, in the order they were added. Until any are chosen the
+// best sellers are shown, and choosing starts from them.
+function compareItems(episode, ctx, section, controls, body) {
+  const chips = h("div", { class: "compare-chips" });
+  const picker = h("select", { class: "item-select compare-add", "aria-label": "Add an item to compare", disabled: true });
+  controls.replaceChildren(chips, picker);
+  let shown = [];
+
+  const choose = (names) => {
+    saveChartSetting(episode, "compare", { names });
+    load();
+  };
+
+  async function load() {
+    section.classList.add("loading");
+    const names = episode.chart_settings.compare?.names;
+    const params = new URLSearchParams({ window: episode.window });
+    if (names) {
+      params.set("chosen", "1");
+      names.forEach((name) => params.append("name", name));
+    }
+    const result = await attempt(() => api("GET", `/api/data/${episode.source}/compare?${params}`));
+    section.classList.remove("loading");
+    if (!result || result.empty || !picker.isConnected) return;
+    shown = result.items.map((row) => row.name);
+    chips.replaceChildren(...result.items.map((row) => h("span", { class: "compare-chip" },
+      row.icon ? h("img", { class: "item-icon", src: row.icon, alt: "" }) : h("span", { class: "item-icon" }),
+      h("span", { class: "compare-chip-name" }, row.name),
+      h("button", { class: "icon-button", "aria-label": `Stop comparing ${row.name}`, title: "Remove",
+        onclick: () => choose(shown.filter((name) => name !== row.name)) }, "×"))));
+    const full = shown.length >= result.limit;
+    const left = result.choices.filter((choice) => !shown.includes(choice.name));
+    picker.replaceChildren(
+      h("option", { value: "", selected: true }, full ? `Up to ${result.limit} items` : left.length ? "Add an item…" : "No other items in this window"),
+      ...left.map((choice) => h("option", { value: choice.name }, choiceLabel(choice))));
+    picker.disabled = full || !left.length;
+    body.replaceChildren(result.items.length
+      ? figureCard("compare", { window: result.window, items: result.items }, ctx, episode)
+      : h("p", { class: "hl-empty" }, "Add items above to compare them."));
+  }
+
+  picker.addEventListener("change", () => {
+    if (picker.value) choose([...shown, picker.value]);
+  });
+  load();
 }
 
 // ---------- Highlights ----------
@@ -959,7 +1034,7 @@ function figureCard(kind, data, ctx, episode) {
       playButton, scrubber, durationSelect,
       h("div", { class: "segmented", role: "group", "aria-label": "Chart layout" }, viewButtons),
       // Bars of cost and item counts always start from nothing, so those have no axis choice.
-      ...(breakdown || kind === "item" ? [] : [
+      ...(breakdown || kind === "item" || kind === "compare" ? [] : [
         h("span", { class: "foot-label" }, "Axis from"),
         h("div", { class: "segmented", role: "group", "aria-label": "Where the vertical axis starts" }, axisButtons),
         customField, axisWarning]),
@@ -1066,30 +1141,123 @@ function loadVisualItem(source, visual) {
 
 const newKey = () => (crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`).slice(0, 36);
 
-// Item cards to overlay in the video: any item with its tooltip and a gold gain or loss.
+// Item cards to overlay in the video: any item with its tooltip and a gold gain or loss,
+// or a gold amount on its own. Top items wait on the right, to drag in or click.
 function renderVisuals(pane, episode, tabButton) {
   const save = () => {
     tabButton.textContent = `Visuals (${episode.visuals.length})`;
     saveLater(`visuals-${episode.id}`, () => api("PATCH", `/api/episodes/${episode.id}`, { visuals: episode.visuals }));
   };
   const list = h("div", { class: "visual-list" });
+  const dropSlot = h("div", { class: "visual-drop-slot", "aria-hidden": "true" }, "Drop here for a new card");
   const paintList = () => {
     list.replaceChildren(...(episode.visuals.length
       ? episode.visuals.map((visual) => visualCard(visual, episode, save, paintList))
-      : [h("div", { class: "empty-state" }, h("h2", {}, "No item cards yet"),
-        h("p", {}, "Search for any item above. Its tooltip appears with a gold amount beside it, ready to export for the video."))]));
+      : [h("div", { class: "empty-state" }, h("h2", {}, "No cards yet"),
+        h("p", {}, "Search for any item above, or drag one in from the top items. Its tooltip appears with a gold amount beside it, ready to export for the video. A gold amount can also go on its own."))]),
+    dropSlot);
   };
-  pane.replaceChildren(itemSearch(episode, (found) => {
-    episode.visuals = [...episode.visuals, { key: newKey(), item_id: found.item_id, name: found.name, copper: 0, place: "right", sell: true, ilvl: true }];
+  // `found` is {item_id, name, copper}, with item_id null for the gold amount alone.
+  const addCard = (found) => {
+    episode.visuals = [...episode.visuals, { key: newKey(), item_id: found.item_id, name: found.name, copper: found.copper ?? 0, place: "right", sell: true, ilvl: true }];
     save();
     paintList();
-    list.lastElementChild?.querySelector(".visual-amount")?.focus();
-  }), list);
+    list.querySelector(".visual-card:last-of-type .visual-amount")?.focus();
+  };
+  // An item dropped on a card takes the place of its item, and fills in the amount if it has none.
+  const swapItem = (key, found) => {
+    const visual = episode.visuals.find((v) => v.key === key);
+    if (!visual) return;
+    Object.assign(visual, { item_id: found.item_id, name: found.name }, visual.copper ? {} : { copper: found.copper ?? 0 });
+    save();
+    paintList();
+  };
+  const goldButton = h("button", { class: "button", title: "A card with the gold amount alone, no item",
+    onclick: () => addCard({ item_id: null, name: "", copper: 0 }) }, icon("plus"), "Gold amount only");
+  const work = h("div", { class: "visual-main" }, itemSearch(episode, (found) => addCard({ ...found, copper: 0 }), goldButton), list);
+  itemDrops(work, (found, card) => (card ? swapItem(card.dataset.key, found) : addCard(found)));
+  pane.replaceChildren(h("div", { class: "visual-layout" }, work, itemTray(episode, addCard)));
   paintList();
 }
 
+const DRAG_TYPE = "application/x-ledger-item";
+
+// Takes items dragged from the tray: onto a card to swap its item, anywhere else to add one.
+function itemDrops(zone, onDrop) {
+  let marked = null;
+  const mark = (el) => {
+    if (marked === el) return;
+    marked?.classList.remove("drop-over");
+    marked = el;
+    el?.classList.add("drop-over");
+  };
+  const carries = (e) => [...(e.dataTransfer?.types ?? [])].includes(DRAG_TYPE);
+  const targetOf = (e) => e.target.closest?.(".visual-card") || zone.querySelector(".visual-drop-slot");
+  zone.addEventListener("dragover", (e) => {
+    if (!carries(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    mark(targetOf(e));
+  });
+  zone.addEventListener("dragleave", (e) => { if (!zone.contains(e.relatedTarget)) mark(null); });
+  zone.addEventListener("drop", (e) => {
+    if (!carries(e)) return;
+    e.preventDefault();
+    const card = e.target.closest?.(".visual-card");
+    mark(null);
+    let found;
+    try { found = JSON.parse(e.dataTransfer.getData(DRAG_TYPE)); } catch { return; }
+    if (found && Number.isInteger(found.item_id)) onDrop(found, card);
+  });
+}
+
+const TRAY_GROUPS = [["sales", "Most sold", "revenue", "Units sold. A card made from one shows what they sold for, after the auction house cut"],
+  ["profit", "Most profit", "net", "Net: money in less money out"],
+  ["loss", "Biggest loss", "net", "Net: money in less money out"]];
+
+// The items with the most sales, profit and loss in the episode's window, as icons to drag
+// onto the cards. A click or Enter adds one as a new card, with its amount filled in.
+function itemTray(episode, onPick) {
+  const body = h("div", { class: "tray-body" }, h("p", { class: "tray-note" }, "Loading top items…"));
+  const tray = h("aside", { class: "visual-tray", "aria-label": "Top items" }, h("h2", {}, "Top items"), body);
+  // A sales row shows units sold. Its card still gets the gold they brought in.
+  const tile = (row, copper, units) => {
+    const found = { item_id: row.item_id, name: row.name, copper };
+    const count = `${units?.toLocaleString("en-US")} sold`;
+    return h("button", {
+      class: "tray-item", draggable: true, title: `Drag onto a card, or click to add ${row.name} as a new card`,
+      "aria-label": `Add ${row.name}, ${units == null ? "" : `${count} for `}${moneyWords(copper, { signed: true })}`,
+      ondragstart: (e) => {
+        e.dataTransfer.setData(DRAG_TYPE, JSON.stringify(found));
+        e.dataTransfer.setData("text/plain", row.name);
+        e.dataTransfer.effectAllowed = "copy";
+        tray.closest(".visual-layout")?.classList.add("dragging");
+      },
+      ondragend: () => tray.closest(".visual-layout")?.classList.remove("dragging"),
+      onclick: () => onPick(found),
+    },
+    row.icon ? h("img", { class: "tray-icon", src: row.icon, alt: "", draggable: false }) : h("span", { class: "tray-icon" }),
+    h("span", { class: "tray-name" }, row.name),
+    units == null
+      ? h("span", { class: `tray-amount ${copper < 0 ? "loss" : "gain"}` }, moneyNode(copper, { signed: true }))
+      : h("span", { class: "tray-amount", title: `${count} for ${moneyWords(copper)}` }, count));
+  };
+  api("GET", `/api/visual/${episode.source}/top?window=${encodeURIComponent(episode.window)}`).then((result) => {
+    if (result.empty) {
+      body.replaceChildren(h("p", { class: "tray-note" }, "Nothing imported for this source yet."));
+      return;
+    }
+    body.replaceChildren(h("p", { class: "tray-note" }, `In ${result.window.label}. Drag onto a card to swap its item, or below the cards for a new one.`),
+      ...TRAY_GROUPS.map(([key, heading, field, about]) => h("section", { class: "tray-group" },
+        h("h3", { title: about }, heading),
+        result[key].length ? h("div", { class: "tray-items" }, result[key].map((row) => tile(row, row[field], key === "sales" ? row.sold : null)))
+          : h("p", { class: "tray-note" }, "None in this window"))));
+  }, (err) => body.replaceChildren(h("p", { class: "tray-note" }, err.message)));
+  return tray;
+}
+
 // Finds items in this source's ledger first, then on Wowhead, as you type.
-function itemSearch(episode, onPick) {
+function itemSearch(episode, onPick, extra) {
   const input = h("input", { type: "text", class: "visual-search-input", placeholder: "Search for any item, e.g. Linen Cloth",
     "aria-label": "Search for an item", autocomplete: "off", role: "combobox", "aria-expanded": "false", "aria-controls": "visual-results" });
   const results = h("ul", { class: "visual-results", id: "visual-results", role: "listbox", hidden: true });
@@ -1127,14 +1295,16 @@ function itemSearch(episode, onPick) {
     if (e.key === "Escape") close();
   });
   return h("div", { class: "visual-search" }, h("span", { class: "filter-label" }, "Add item"),
-    h("div", { class: "visual-search-box" }, input, results),
+    h("div", { class: "visual-search-box" }, input, results), extra,
     h("span", { class: "figure-note" }, `Tooltips from Wowhead's ${episode.source === "tbc" ? "TBC" : "Forever"} data`));
 }
 
 function visualCard(visual, episode, save, repaintList) {
   const holder = h("div", { class: "visual-holder" });
   const note = h("p", { class: "visual-note", hidden: true });
-  let item = null;
+  const goldOnly = visual.item_id == null;
+  const label = goldOnly ? "the gold amount" : visual.name;
+  let item = null, ready = goldOnly;
   const update = (changes) => {
     Object.assign(visual, changes);
     save();
@@ -1143,15 +1313,19 @@ function visualCard(visual, episode, save, repaintList) {
 
   let drawn = 0;
   async function paint() {
-    if (!item) return;
+    if (!ready) return;
     const ticket = ++drawn;
     const density = 2 * (window.devicePixelRatio || 1);
     const canvas = await drawVisual(item, visual, density);
     if (ticket !== drawn) return;
     canvas.style.width = `${(canvas.width / density) * 1.25}px`; // A little larger than in the game.
     canvas.setAttribute("role", "img");
-    const lines = shownLines(item, visual).slice(1).map((line) => line.left.map((s) => s.text).join(""));
-    canvas.setAttribute("aria-label", `${item.name}. ${lines.join(". ")}. ${valueWords(visual.copper)}`);
+    if (goldOnly) {
+      canvas.setAttribute("aria-label", `Gold amount: ${valueWords(visual.copper)}`);
+    } else {
+      const lines = shownLines(item, visual).slice(1).map((line) => line.left.map((s) => s.text).join(""));
+      canvas.setAttribute("aria-label", `${item.name}. ${lines.join(". ")}. ${valueWords(visual.copper)}`);
+    }
     holder.replaceChildren(canvas);
   }
 
@@ -1164,7 +1338,7 @@ function visualCard(visual, episode, save, repaintList) {
   const commit = () => update({ copper: sign * amount() });
   const inputs = Object.fromEntries(Object.keys(pieces).map((coin) => [coin, h("input", {
     type: "number", class: `visual-amount ${coin}`, min: 0, max: coin === "gold" ? 99999999 : 99, step: 1,
-    value: pieces[coin] || "", placeholder: "0", "aria-label": `${coin[0].toUpperCase()}${coin.slice(1)} for ${visual.name}`, oninput: commit })]));
+    value: pieces[coin] || "", placeholder: "0", "aria-label": `${coin[0].toUpperCase()}${coin.slice(1)} for ${label}`, oninput: commit })]));
   const signButtons = [["Gain", 1], ["Loss", -1]].map(([text, value]) => h("button", {
     "aria-pressed": String(value === sign),
     onclick: () => {
@@ -1181,36 +1355,43 @@ function visualCard(visual, episode, save, repaintList) {
   const toggle = (flag, text) => h("label", { class: "character-chip" },
     h("input", { type: "checkbox", checked: visual[flag] !== false, onchange: (e) => update({ [flag]: e.target.checked }) }), text);
 
-  const fileName = () => `${`${episode.title}-${item?.name || visual.name}`.replace(/[^\w-]+/g, "-").toLowerCase()}.png`;
-  const exportButton = h("button", { class: "button", disabled: true, title: "A transparent PNG at three times the game's tooltip size, to lay over footage",
+  const fileName = () => `${`${episode.title}-${goldOnly ? `gold-${valueWords(visual.copper)}` : item?.name || visual.name}`
+    .replace(/[^\w-]+/g, "-").toLowerCase()}.png`;
+  const exportButton = h("button", { class: "button", disabled: !goldOnly, title: "A transparent PNG at three times the game's tooltip size, to lay over footage",
     onclick: () => attempt(async () => saveBlob((await visualBlob(item, visual)).blob, fileName())) }, "Export PNG");
-  const copyButton = h("button", { class: "button quiet", disabled: true, title: "Copies the transparent PNG, to paste into an editor",
+  const copyButton = h("button", { class: "button quiet", disabled: !goldOnly, title: "Copies the transparent PNG, to paste into an editor",
     onclick: () => attempt(async () => {
       const { blob } = await visualBlob(item, visual);
       await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
       copyButton.textContent = "Copied";
       setTimeout(() => { copyButton.textContent = "Copy image"; }, 1500);
     }) }, "Copy image");
-  const removeButton = h("button", { class: "icon-button", title: "Remove this card", "aria-label": `Remove ${visual.name}`, onclick: () => {
+  const removeButton = h("button", { class: "icon-button", title: "Remove this card", "aria-label": `Remove ${label}`, onclick: () => {
     episode.visuals = episode.visuals.filter((other) => other.key !== visual.key);
     save();
     repaintList();
   } }, icon("trash"));
 
   const coinField = (coin) => h("span", { class: "axis-custom" }, inputs[coin], h("img", { class: "coin", src: COINS[coin], alt: coin }));
-  const card = h("article", { class: "figure-card visual-card" },
+  const card = h("article", { class: `figure-card visual-card${goldOnly ? " gold-only" : ""}`, "data-key": visual.key },
     h("div", { class: "visual-stage" }, holder), note,
     h("div", { class: "figure-foot" },
-      h("span", { class: "foot-label" }, "Amount"),
+      h("span", { class: "foot-label" }, goldOnly ? "Gold only" : "Amount"),
       h("div", { class: "segmented", role: "group", "aria-label": "Gain or loss" }, signButtons),
       coinField("gold"), coinField("silver"), coinField("copper"),
-      h("div", { class: "segmented", role: "group", "aria-label": "Where the amount goes" }, placeButtons),
-      toggle("ilvl", "Item level"), toggle("sell", "Sell price"),
+      goldOnly ? null : [
+        h("div", { class: "segmented", role: "group", "aria-label": "Where the amount goes" }, placeButtons),
+        toggle("ilvl", "Item level"), toggle("sell", "Sell price")],
       h("span", { class: "spacer" }), copyButton, exportButton, removeButton));
 
+  if (goldOnly) {
+    paint();
+    return card;
+  }
   holder.append(h("div", { class: "visual-note" }, `Loading ${visual.name}…`));
   loadVisualItem(episode.source, visual).then((loaded) => {
     item = loaded;
+    ready = true;
     exportButton.disabled = copyButton.disabled = false;
     if (!loaded.found) {
       note.textContent = "Wowhead's tooltip couldn't be fetched (offline, or no such item), so only the name shows. It's tried again next time this tab opens.";

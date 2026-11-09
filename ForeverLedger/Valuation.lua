@@ -341,8 +341,8 @@ function F.OnSale(characters)
     return sum
 end
 
--- The sample nearest time t, and the series whose drawn line passes within
--- tolerance of value v at t.
+-- The sample nearest time t, the series whose drawn line passes within tolerance of
+-- value v at t, and the series whose drawn area holds v at t.
 function F.HistoryAt(points,t,v,tolerance)
     local closest,before,after=points[1]
     for _,p in ipairs(points) do
@@ -352,13 +352,23 @@ function F.HistoryAt(points,t,v,tolerance)
     end
     before,after=before or after,after or before
     local f=after.time>before.time and (t-before.time)/(after.time-before.time) or 0
-    local hit,best
+    local hit,best,area
     for j,a in ipairs(after.values) do
         local b=before.values[j].value
-        local distance=math.abs(b+(a.value-b)*f-v)
+        local y=b+(a.value-b)*f
+        local distance=math.abs(y-v)
         if distance<=tolerance and (not best or distance<best) then best=distance; hit=a.key end
+        if not area and v>=0 and v<=y then area=a.key end
     end
-    return closest,hit
+    return closest,hit,area
+end
+
+-- One band's own exact value at a chart sample, not stacked or smoothed.
+function F.BandValue(point,key)
+    if key~=F.OTHER_BAND then return point.bands[key] or 0 end
+    local folded=point.bands[key] or 0
+    for band in pairs(point.other or {}) do folded=folded+(point.bands[band] or 0) end
+    return folded
 end
 
 -- One character's value per band of a chart sample: its selected types, one band for
@@ -502,11 +512,7 @@ end
 -- day's first login, or midnight for a session that began yesterday.
 function F.GainStart(now)
     local events=F.db.events
-    if F.db.episode then
-        for i=#events,1,-1 do
-            if events[i].kind=="episode_start" then return events[i].time end
-        end
-    end
+    if F.db.episode and (F.db.markerAt or 0)>0 then return F.db.markerAt end
     local t=date("*t",now)
     local midnight=now-(t.hour*3600+t.min*60+t.sec)
     local first=midnight
@@ -662,17 +668,26 @@ function F.ReputationSavingsLines()
 end
 
 -- Episode starts and ends inside a time range. An end that overlaps the next
--- start is dropped, so only that start shows.
+-- start is dropped, so only that start shows. A marker taken over from a linked
+-- account is recorded when it arrived but shows when it began there, and a start of
+-- the marker already running isn't shown again.
 function F.EpisodeMarkers(first,last,overlap)
-    local markers={}
-    for _,e in ipairs(F.db.events) do
-        if (e.kind=="episode_start" or e.kind=="episode_end") and e.time>=first and e.time<=last then
-            local m={time=e.time,start=e.kind=="episode_start",name=e.data.name}
-            local previous=markers[#markers]
-            if m.start and previous and not previous.start and m.time-previous.time<=overlap then
-                markers[#markers]=m
-            else markers[#markers+1]=m end
+    local found={}
+    for i,e in ipairs(F.db.events) do
+        local time=F.EventTime(e)
+        if (e.kind=="episode_start" or e.kind=="episode_end") and time>=first and time<=last then
+            found[#found+1]={time=time,start=e.kind=="episode_start",name=e.data.name,order=i}
         end
+    end
+    table.sort(found,function(a,b) if a.time~=b.time then return a.time<b.time end return a.order<b.order end)
+    local markers={}
+    for _,m in ipairs(found) do
+        local previous=markers[#markers]
+        m.order=nil
+        if m.start and previous and previous.start and previous.name==m.name then
+        elseif m.start and previous and not previous.start and m.time-previous.time<=overlap then
+            markers[#markers]=m
+        else markers[#markers+1]=m end
     end
     return markers
 end

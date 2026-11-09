@@ -385,6 +385,9 @@ class ValuationTests(unittest.TestCase):
         plot.scripts.OnUpdate(plot)
         assert(F.chart.cross:IsShown() and F.chart.total.text:find("Total",1,true))
         assert(TIP[1]=="Gold" and #TIP>1)
+        function GetCursorPosition() return 550,265 end
+        plot.scripts.OnUpdate(plot)
+        assert(#TIP==0)
         plot.scripts.OnLeave()
         assert(not F.chart.cross:IsShown() and #TIP==0)
         ''')
@@ -1222,6 +1225,32 @@ class ValuationTests(unittest.TestCase):
         got=json.loads(self.run_lua('return F.JSON(M)'))
         self.assertEqual([(m['time'],m.get('name')) for m in got],[(1000,"One"),(2005,"Two"),(3000,None),(4000,"Three")])
 
+    def test_a_marker_from_the_linked_account_shows_where_it_began(self):
+        self.run_lua('''
+        local function at(kind,t,data) local e=F.Emit(kind,data); e.time=t end
+        at("episode_start",1000,{name="One"}); at("episode_start",1600,{name="Two",occurredAt=1500})
+        at("episode_start",1700,{name="Two"})
+        M=F.EpisodeMarkers(1000,5000,10)
+        ''')
+        got=json.loads(self.run_lua('return F.JSON(M)'))
+        self.assertEqual([(m['time'],m.get('name')) for m in got],[(1000,"One"),(1500,"Two")])
+
+    def test_marker_time_is_read_from_records_saved_before_it_was_kept(self):
+        self.run_lua('''
+        local e=F.Emit("episode_start",{name="Old"}); e.time=1234
+        F.db.markerAt=nil; F.db.episode="Old"; F.Init(F.db,F.identity)
+        ''')
+        self.assertEqual(self.run_lua('return F.db.markerAt'),1234)
+        self.assertEqual(self.run_lua('return F.GainStart(F.Now())'),1234)
+
+    def test_ending_without_a_marker_records_nothing(self):
+        before=len(self.kind('episode_end'))
+        self.run_lua('F.Command("end")')
+        self.assertEqual(len(self.kind('episode_end')),before)
+        self.run_lua('F.SetMarker("A"); F.Command("end")')
+        self.assertEqual(len(self.kind('episode_end')),before+1)
+        self.assertIsNone(self.run_lua('return F.db.episode'))
+
     def test_mail_items_and_money_count_unless_cod(self):
         self.gear()
         self.run_lua('''
@@ -1629,6 +1658,52 @@ class ValuationTests(unittest.TestCase):
         self.assertEqual(self.run_lua('return HIT2'),"assets")
         self.assertEqual(self.run_lua('return MISS'),None)
         self.assertEqual(self.run_lua('return CLAMPED'),"gold")
+
+    def test_history_at_finds_the_area_under_the_cursor(self):
+        self.run_lua('''
+        P={{time=0,values={{key="gold",value=100},{key="assets",value=300}},raw={}},
+           {time=10,values={{key="gold",value=200},{key="assets",value=500}},raw={}}}
+        _,LINE,GOLD=F.HistoryAt(P,5,60,5)
+        _,_,ASSETS=F.HistoryAt(P,5,250,5)
+        _,_,ABOVE=F.HistoryAt(P,5,450,5)
+        _,ON,UNDER=F.HistoryAt(P,5,150,5)
+        ''')
+        self.assertEqual(self.run_lua('return LINE'),None)
+        self.assertEqual(self.run_lua('return GOLD'),"gold")
+        self.assertEqual(self.run_lua('return ASSETS'),"assets")
+        self.assertEqual(self.run_lua('return ABOVE'),None)
+        self.assertEqual(self.run_lua('return ON'),"gold")
+        self.assertEqual(self.run_lua('return UNDER'),"gold")
+
+    def test_band_value_is_the_bands_own_exact_value(self):
+        self.run_lua('''
+        POINT={bands={gold=120,Cloth=40,Herb=15,[F.OTHER_BAND]=5},other={Herb=true}}
+        ''')
+        self.assertEqual(self.run_lua('return F.BandValue(POINT,"gold")'),120)
+        self.assertEqual(self.run_lua('return F.BandValue(POINT,"Ore")'),0)
+        self.assertEqual(self.run_lua('return F.BandValue(POINT,F.OTHER_BAND)'),20)
+
+    def test_hovering_an_area_shows_only_that_bands_value(self):
+        self.install_widgets()
+        self.bands()
+        self.run_lua('''
+        F.Show()
+        local c=F.chart
+        local plot=c.plot
+        function plot:IsMouseOver() return true end
+        function plot:GetLeft() return 0 end
+        function plot:GetBottom() return 0 end
+        function plot:GetEffectiveScale() return 1 end
+        GameTooltip.AddDoubleLine=function(_,left,right) TIP[#TIP+1]=left; RIGHT=right end
+        local last=c.points[#c.points]
+        assert(last.values[2].key=="assets")
+        local middle=(last.values[1].value+last.values[2].value)/2
+        function GetCursorPosition() return 550,middle/c.maximum*266 end
+        plot.scripts.OnUpdate(plot)
+        ''')
+        self.assertEqual(self.run_lua('return #TIP'),1)
+        self.assertEqual(self.run_lua('return TIP[1]'),"Other assets")
+        self.assertEqual(self.run_lua('return RIGHT'),self.run_lua('return F.Money(2070)'))
 
     def test_summary_has_no_change_history(self):
         summary=self.run_lua('return F.Summary()')

@@ -11,7 +11,9 @@ from pathlib import Path
 FORMATS = ("short", "long")
 STATUSES = ("idea", "scripting", "recording", "editing", "published")
 SOURCES = ("forever", "tbc", "mock")
-CHARTS = ("", "start", "auction", "value", "costs", "revenue", "item")
+CHARTS = ("", "start", "auction", "value", "costs", "revenue", "item", "compare")
+ITEM_VIEWS = ("one", "compare")
+MAX_COMPARED = 6
 RANGES = ("window", "to_date")
 AXIS_MODES = ("zero", "fit", "custom")
 
@@ -77,8 +79,9 @@ def _choice(value, choices, field):
 
 
 def _chart_settings(value):
-    """Per chart: where its vertical axis starts, how long its animation runs, and for the
-    item chart, which item it shows."""
+    """Per chart: where its vertical axis starts, how long its animation runs, for the
+    item chart which item it shows and whether it compares items instead, and for the
+    comparison which items, in order."""
     if not isinstance(value, dict) or not set(value) <= set(CHARTS) - {""}:
         raise Invalid("Chart settings are not valid")
     clean = {}
@@ -108,6 +111,15 @@ def _chart_settings(value):
             if not isinstance(name, str) or len(name) > 200:
                 raise Invalid("The item name is not valid")
             entry["name"] = name
+        if chart == "item" and "view" in settings:
+            # The item section shows one item, or several side by side.
+            entry["view"] = _choice(settings["view"], ITEM_VIEWS, "Item view")
+        if chart == "compare" and "names" in settings:
+            names = settings["names"]
+            if (not isinstance(names, list) or len(names) > MAX_COMPARED
+                    or not all(isinstance(n, str) and 0 < len(n) <= 200 for n in names)):
+                raise Invalid("The items to compare are not valid")
+            entry["names"] = list(dict.fromkeys(names))
         clean[chart] = entry
     return json.dumps(clean)
 
@@ -119,7 +131,7 @@ MAX_COPPER = 10 ** 15
 
 def _visuals(value):
     """Item cards for the video: an item, a gold amount that can be a gain or a loss, and
-    which optional tooltip lines it shows."""
+    which optional tooltip lines it shows. A card with item ID None is the amount alone."""
     if not isinstance(value, list) or len(value) > MAX_VISUALS:
         raise Invalid(f"Visuals must be a list of at most {MAX_VISUALS}")
     clean = []
@@ -130,7 +142,7 @@ def _visuals(value):
         copper = visual.get("copper", 0)
         if not isinstance(key, str) or not 0 < len(key) <= 40:
             raise Invalid("A visual needs a key")
-        if isinstance(item_id, bool) or not isinstance(item_id, int) or not 0 < item_id < 10 ** 9:
+        if item_id is not None and (isinstance(item_id, bool) or not isinstance(item_id, int) or not 0 < item_id < 10 ** 9):
             raise Invalid("A visual needs an item ID")
         if not isinstance(name, str) or len(name) > 200:
             raise Invalid("The item name is not valid")

@@ -10,6 +10,7 @@ export const CHARTS = {
   costs: "Cost breakdown",
   revenue: "Revenue breakdown",
   item: "Item analysis",
+  compare: "Item comparison",
 };
 
 const C = {
@@ -696,8 +697,14 @@ function statTile(x, y, w, s, tile, at) {
   return reveal(at.toFixed(3), out);
 }
 
+// What an item's units were used to craft: the one item, or how many items.
+function usedInto(used) {
+  return used.into.length === 1 ? used.into[0].name : `${used.into.length} items`;
+}
+
 function spentNote(d) {
   if (d.materials_unknown) return "Some materials have no cost on record";
+  if (d.spent?.used_in_crafts) return `Less ${plural(d.used.units, "unit", "units")} used in crafts`;
   if (d.spent.materials && d.spent.bought) return "Buying it, and materials to craft it";
   if (d.spent.materials) return "Materials to craft it";
   return d.spent.purchases ? "Buying it outright" : "Nothing bought";
@@ -766,6 +773,9 @@ function itemFigure(data, ctx, options) {
     ...listed.map((r) => plain({ label: `${r.name} ×${number.format(r.used)}`, copper: r.cost, icon: r.icon ?? null })),
     ...(rest.length ? [plain({ label: `${rest.length} other materials`, copper: rest.reduce((sum, r) => sum + r.cost, 0) })] : []),
     ...(gained.crafts && !d.recipe ? [plain({ label: "Materials: recipe not seen", copper: 0 })] : []),
+    ...(spent.listing_fees ? [plain({ label: `Unsold listings (${number.format(d.listings.unsold)})`, copper: spent.listing_fees })] : []),
+    // Units that went into other crafts are counted in those items' cost instead.
+    ...(spent.used_in_crafts ? [{ label: `Used to craft ${usedInto(d.used)} (×${number.format(d.used.units)})`, copper: -spent.used_in_crafts, signed: true }] : []),
     plain({ label: "Total spent", copper: spent.total, strong: true }),
   ];
   const tone = d.net > 0 ? "gain" : d.net < 0 ? "loss" : null;
@@ -777,9 +787,219 @@ function itemFigure(data, ctx, options) {
   return { svg: shell(L, head.svg + out), hover: { kind: "bars", hits, s }, anim: { kind: "hbars", bars }, axis: { start: 0, ignored: false } };
 }
 
-const BUILDERS = { start: startFigure, auction: auctionFigure, value: valueFigure, item: itemFigure,
+// ---------- Item comparison ----------
+
+export const percent = (share) => (share == null ? "–" : `${number.format(Math.round(share * 100))}%`);
+
+// The figures compared, in the order shown. `best` says which way is better, for the
+// columns where that is plain; how many were listed or came back depends on how many
+// were made, so those have none.
+const COMPARE_COLUMNS = [
+  { key: "net", label: "Net profit", short: "Net profit", money: true, signed: true, best: "high" },
+  { key: "profit_sold", label: "Profit on sold", short: "Profit on sold", money: true, signed: true, best: "high" },
+  // The units held, with what they cost under them: where profit went when it was reinvested.
+  { key: "stock", label: "In stock", short: "In stock", note: "stock_value" },
+  { key: "sold", label: "Sold", short: "Sold", best: "high" },
+  { key: "margin", label: "Margin each", short: "Margin each", money: true, signed: true, best: "high" },
+  { key: "margin_share", label: "Margin % of cost", short: "Margin %", percent: true, best: "high" },
+  { key: "listed", label: "Listed", short: "Listed" },
+  { key: "unsold", label: "Unsold", short: "Unsold" },
+  { key: "sales_rate", label: "Sales rate", short: "Sales rate", percent: true, best: "high", meter: true },
+];
+
+// Why a margin percentage is missing, in a few words.
+export function marginShareNote(row) {
+  if (row.margin_share != null) return "";
+  if (row.unit_cost === 0) return "Farmed, so it cost nothing";
+  if (row.unit_cost == null) return "No cost on record";
+  return "Nothing sold";
+}
+
+// The row holding each column's best value, when two or more rows have one to compare.
+function bestRows(rows) {
+  const best = {};
+  COMPARE_COLUMNS.filter((col) => col.best).forEach((col) => {
+    const known = rows.filter((row) => row[col.key] != null);
+    if (known.length < 2) return;
+    const top = Math.max(...known.map((row) => row[col.key]));
+    if (known.filter((row) => row[col.key] === top).length === 1) best[col.key] = known.find((row) => row[col.key] === top);
+  });
+  return best;
+}
+
+const STOCK_PLACES = { bags: "in bags", bank: "in the bank", mail: "in the mailbox", auctions: "on the auction house" };
+// Where the stock is held, after a colon, or nothing when there is none.
+export function stockWhere(row) {
+  const places = Object.entries(row.stock_places ?? {}).map(([place, units]) => `${number.format(units)} ${STOCK_PLACES[place] ?? place}`);
+  return places.length ? `: ${places.join(", ")}` : "";
+}
+
+function compareTip(row) {
+  const count = (n) => number.format(n);
+  return [
+    { copper: row.net, signed: true, label: "net profit: sales after the cut, less buying, crafting and unsold listing fees" },
+    row.profit_sold == null ? { text: "–", label: "profit on sold: no cost on record" }
+      : { copper: row.profit_sold, signed: true, label: "profit on the units sold, each at its average cost, less unsold listing fees" },
+    row.stock == null ? { text: "–", label: "in stock: no bags, bank or mail seen yet" }
+      : { text: number.format(row.stock), label: `in stock${stockWhere(row)}` },
+    ...(row.stock && row.stock_value != null ? [{ copper: row.stock_value, label: "what the stock cost, at the average cost each" }] : []),
+    { text: count(row.sold), label: row.sold === row.auction_sold || !row.sold ? "sold" : `sold, ${count(row.auction_sold)} at auction` },
+    ...(row.each == null ? [] : [{ copper: row.each, label: "each on average, after the auction house cut" }]),
+    ...(row.unit_cost == null ? [{ text: "–", label: "cost each: no cost on record" }]
+      : [{ copper: row.unit_cost, label: `cost each on average${row.cost_partial ? ", some costs unknown" : ""}` }]),
+    ...(row.margin == null ? [] : [{ copper: row.margin, signed: true, label: "margin each" }]),
+    { text: percent(row.margin_share), label: row.margin_share == null ? `margin % of cost: ${marginShareNote(row).toLowerCase()}` : "margin as a share of cost" },
+    { text: count(row.listed), label: plural(row.listed, "auction listed", "auctions listed").replace(/^[\d,]+ /, "") },
+    { text: count(row.unsold), label: `came back unsold${row.unsold_units ? `, ${plural(row.unsold_units, "unit", "units")}` : ""}` },
+    ...(row.listing_fees ? [{ copper: row.listing_fees, label: "deposits kept on unsold listings" }] : []),
+    { text: percent(row.sales_rate), label: row.sales_rate == null ? "sales rate: nothing sold or returned at auction" : `of auction units sold${row.rate_partial ? " (some returns had no quantity)" : ""}` },
+  ];
+}
+
+// One line per item, each figure in its column, and a meter for the sales rate. The
+// best of each column where better is plain sits on a highlight. A Short stacks a
+// card per item instead, as a table would be too narrow to read.
+function compareFigure(data, ctx, options) {
+  const L = layoutFor(options), s = L.s;
+  const rows = data.items ?? [];
+  const head = header(L, ctx, CHARTS.compare, `${plural(rows.length, "item", "items")}  ·  ${subtitleFor(ctx, data.window.start, data.window.end)}`);
+  const area = { x: L.pad.left, y: head.bottom, w: L.innerW, h: L.H - L.pad.bottom - head.bottom };
+  const axis = { start: 0, ignored: false };
+  if (!rows.length) {
+    return { svg: shell(L, head.svg + emptyMessage(area, "Choose items to compare", s)), hover: null, anim: null, axis };
+  }
+  const best = bestRows(rows);
+  const bars = [], hits = [];
+  const at = (i) => 0.08 + (0.55 * i) / Math.max(1, rows.length - 1);
+
+  function cellValue(row, col) {
+    const value = row[col.key];
+    if (value == null) return { text: "–" };
+    if (col.money) return { copper: value, signed: col.signed && value !== 0 };
+    if (col.percent) return { text: percent(value) };
+    return { text: number.format(value) };
+  }
+  const toneOf = (row, col) => (col.money && col.signed)
+    ? (row[col.key] > 0 ? C.gain : row[col.key] < 0 ? C.loss : C.text) : C.text;
+  const segmentsOf = (row, col) => {
+    const value = cellValue(row, col);
+    return value.text != null ? [value.text] : [{ copper: value.copper, signed: value.signed }];
+  };
+  // A value ending at `x`, or starting there, on a highlight when it is the column's best.
+  function drawValue(x, baseline, row, col, size, anchor = "end") {
+    const segments = segmentsOf(row, col), width = runWidth(segments, size, 600, COIN_SCALE);
+    let out = "";
+    if (best[col.key] === row) {
+      const px = size * 0.4, py = size * 0.22;
+      const left = anchor === "end" ? x - width - px : x - px;
+      out += `<rect x="${left}" y="${baseline - size * 0.82 - py}" width="${width + 2 * px}" height="${size + 2 * py}" rx="${size * 0.22}" fill="${C.grid}" stroke="${C.value}" stroke-opacity="0.6"/>`;
+    }
+    const fill = segments[0] === "–" ? C.text3 : toneOf(row, col);
+    return out + run(x, baseline, segments, { size, weight: 600, fill, anchor });
+  }
+  function meter(x, y, w, row, from) {
+    const h = 5 * s, rate = row.sales_rate ?? 0;
+    let out = `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${h / 2}" fill="${C.grid}"/>`;
+    const width = rate > 0 ? Math.max(h, w * rate) : 0;
+    out += `<path data-hbar="${bars.length}" d="${width ? rowPath(x, y, width, h, h / 2) : ""}" fill="${C.sold}"/>`;
+    bars.push({ x, y, width, height: h, radius: h / 2, from, to: Math.min(1, from + 0.3) });
+    return out;
+  }
+  function itemLabel(x, y, box, row, width, size) {
+    let out = "";
+    if (row.icon) out += `<image x="${x}" y="${y}" width="${box}" height="${box}" href="${escapeXml(row.icon)}"/>`;
+    out += `<rect x="${x}" y="${y}" width="${box}" height="${box}" rx="${2 * s}" fill="none" stroke="${C.axis}"/>`;
+    out += text(x + box + 10 * s, y + box / 2 + size * 0.35, fit(row.name, width - box - 14 * s, size), { size, weight: 600 });
+    return out;
+  }
+
+  // A cell's note under or beside its value: what the stock cost.
+  const noteOf = (row, col) => (col.note && row[col.key] && row[col.note] != null ? ["≈ ", { copper: row[col.note] }] : null);
+  // The largest size up to `base` at which every value in these columns fits `room`,
+  // with space for a highlight, and for a meter beside a sales rate.
+  function fittedSize(base, cols, room) {
+    let size = base;
+    rows.forEach((row) => cols.forEach((col) => {
+      const need = runWidth(segmentsOf(row, col), base, 600, COIN_SCALE) + base * 0.8 + (col.meter ? 26 * s : 0);
+      if (need > room) size = Math.min(size, (base * room) / need);
+    }));
+    return size;
+  }
+  const hit = (row, y, h) => ({ x: area.x, y, w: area.w, h, title: row.name, text: `net ${moneyWords(row.net, { signed: true })}`, rows: compareTip(row) });
+
+  let out = "";
+  if (!L.tall) {
+    const labelSize = 12 * s, nameW = area.w * 0.2;
+    const colW = (area.w - nameW) / COMPARE_COLUMNS.length;
+    const right = (k) => area.x + nameW + colW * (k + 1) - 4 * s;
+    const headH = labelSize + 14 * s;
+    let headSvg = text(area.x, area.y + labelSize, "Item", { size: labelSize, weight: 600, fill: C.text3 });
+    COMPARE_COLUMNS.forEach((col, k) => {
+      headSvg += text(right(k), area.y + labelSize, fit(col.short, colW - 8 * s, labelSize), { size: labelSize, weight: 600, fill: C.text3, anchor: "end" });
+    });
+    headSvg += line(area.x, area.y + headH - 1, area.x + area.w, area.y + headH - 1, C.axis);
+    out += reveal("0.020", headSvg);
+    // Fewer items get taller rows and bigger figures, up to a point.
+    const rowH = Math.min(84 * s, (area.h - headH) / rows.length);
+    const size = fittedSize(clamp(rowH * 0.27, 13 * s, 18 * s), COMPARE_COLUMNS, colW - 6 * s);
+    rows.forEach((row, i) => {
+      const y = area.y + headH + rowH * i, middle = y + rowH / 2, baseline = middle + size * 0.35;
+      const box = Math.min(36 * s, rowH * 0.62);
+      let rowSvg = itemLabel(area.x, middle - box / 2, box, row, nameW - 8 * s, size);
+      COMPARE_COLUMNS.forEach((col, k) => {
+        rowSvg += drawValue(right(k), baseline, row, col, size);
+        const note = noteOf(row, col);
+        if (note) rowSvg += run(right(k), baseline + size * 0.95, note, { size: size * 0.66, fill: C.text2, anchor: "end" });
+        if (col.meter) {
+          const textW = runWidth(segmentsOf(row, col), size, 600, COIN_SCALE) + size * 0.8;
+          const meterW = Math.min(colW * 0.45, colW - textW - 10 * s);
+          if (meterW > 10 * s) out += meter(right(k) - textW - 4 * s - meterW, middle - 2.5 * s, meterW, row, at(i));
+        }
+      });
+      if (i < rows.length - 1) rowSvg += line(area.x, y + rowH - 0.5, area.x + area.w, y + rowH - 0.5);
+      out += reveal(at(i).toFixed(3), rowSvg);
+      hits.push(hit(row, y, rowH));
+    });
+  } else {
+    // Four figures across and two down, under each item's name.
+    // Every gap is a share of the card, so six cramped cards keep their figures apart.
+    const gap = Math.min(16 * s, area.h * 0.015), cardH = Math.min(150 * s, (area.h - gap * (rows.length - 1)) / rows.length);
+    const nameH = cardH * 0.22, nameSize = Math.min(17 * s, nameH * 0.6), statH = (cardH - nameH) / 2;
+    const layout = [["net", "profit_sold", "stock", "sold"], ["margin", "margin_share", "unsold", "sales_rate"]];
+    const colW = area.w / layout[0].length;
+    const labelSize = Math.min(11 * s, statH * 0.24);
+    const size = fittedSize(Math.min(16 * s, statH * 0.4), COMPARE_COLUMNS, colW - 12 * s);
+    rows.forEach((row, i) => {
+      const y = area.y + (cardH + gap) * i, box = nameH * 0.8;
+      let card = itemLabel(area.x, y + (nameH - box) / 2, box, row, area.w, nameSize);
+      layout.forEach((keys, r) => keys.forEach((key, k) => {
+        const col = COMPARE_COLUMNS.find((c) => c.key === key);
+        const x = area.x + colW * k, labelY = y + nameH + statH * r + statH * 0.08 + labelSize;
+        const label = key === "unsold" ? `Unsold of ${number.format(row.listed)} listed` : col.label;
+        card += text(x + 6 * s, labelY, fit(label, colW - 16 * s, labelSize), { size: labelSize, weight: 600, fill: C.text3 });
+        const baseline = labelY + statH * 0.1 + size * 0.85;
+        card += drawValue(x + 6 * s, baseline, row, col, size, "start");
+        const after = x + 6 * s + runWidth(segmentsOf(row, col), size, 600, COIN_SCALE) + size * 0.5;
+        const note = noteOf(row, col), noteSize = size * 0.66;
+        if (note && after + runWidth(note, noteSize, 400, COIN_SCALE) <= x + colW - 8 * s) {
+          card += run(after, baseline, note, { size: noteSize, fill: C.text2 });
+        }
+        if (col.meter) {
+          const from = after + 6 * s, room = x + colW - 12 * s - from;
+          if (room > 20 * s) out += meter(from, baseline - size * 0.33 - 2.5 * s, room, row, at(i));
+        }
+      }));
+      if (i < rows.length - 1) card += line(area.x, y + cardH + gap / 2, area.x + area.w, y + cardH + gap / 2);
+      out += reveal(at(i).toFixed(3), card);
+      hits.push(hit(row, y, cardH));
+    });
+  }
+  return { svg: shell(L, head.svg + out), hover: { kind: "bars", hits, s }, anim: { kind: "hbars", bars }, axis };
+}
+
+const BUILDERS = { start: startFigure, auction: auctionFigure, value: valueFigure, item: itemFigure, compare: compareFigure,
   costs: (...args) => breakdownFigure("costs", ...args), revenue: (...args) => breakdownFigure("revenue", ...args) };
-const SCREEN = { start: { width: 1200, height: 500 }, auction: { width: 1200, height: 500 }, value: { width: 1200, height: 460 }, costs: { width: 1200, height: 500 }, revenue: { width: 1200, height: 500 }, item: { width: 1200, height: 500 } };
+const SCREEN = { start: { width: 1200, height: 500 }, auction: { width: 1200, height: 500 }, value: { width: 1200, height: 460 }, costs: { width: 1200, height: 500 }, revenue: { width: 1200, height: 500 }, item: { width: 1200, height: 500 }, compare: { width: 1200, height: 500 } };
 const EXPORT_SIZES = { short: { width: 1080, height: 1920, tall: true, scale: 2.1 }, long: { width: 1920, height: 1080, tall: false, scale: 1.6 } };
 
 // `tall` shows the vertical layout on screen, exactly as a Short's image has it.
@@ -1123,9 +1343,27 @@ export function tableFor(kind, data, settings) {
       ...reagents.map((r) => [`   ${r.name}`, number.format(r.used), money(r.cost), r.unit_cost == null
         ? `${r.per_craft} per craft. No cost on record: never bought, farmed or crafted`
         : `${r.per_craft} per craft, ${moneyWords(r.unit_cost)} each on average`]),
+      ...(d.listings?.unsold ? [["Unsold listing fees", number.format(d.listings.unsold), money(spent.listing_fees ?? 0),
+        [`Deposits kept on listings that came back, of ${plural(d.listings.listed, "listing", "listings")} here`,
+          d.listings.unpriced ? `${d.listings.unpriced} with no deposit on record` : ""].filter(Boolean).join(", ")]] : []),
+      ...(d.used?.units ? [["Used to craft other items", number.format(d.used.units), money(-(spent.used_in_crafts ?? 0), true), [
+        d.used.into.map((u) => `${u.name} ×${number.format(u.units)}`).join(", "),
+        d.used.unpriced ? "No cost on record, so nothing taken off"
+          : d.used.credited < d.used.value ? `${moneyWords(d.used.value)} at cost, taken off only up to what was spent here` : "Counted in those items' cost instead",
+      ].join(". ")]] : []),
       ["Total spent", "", money(spent.total), d.materials_unknown ? "Some materials have no cost on record" : ""],
       ["Sales minus spending", "", money(d.net, true), ""],
     ] };
+  }
+  if (kind === "compare") {
+    const orNone = (copper, signed = false) => (copper == null ? "–" : money(copper, signed && copper !== 0));
+    return { columns: ["Item", "Net profit", "Profit on sold", "In stock", "Stock at cost", "Sold", "Each, after the cut", "Cost each",
+      "Margin each", "Margin % of cost", "Listed", "Unsold", "Unsold listing fees", "Sales rate"], numeric: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+    rows: (data.items ?? []).map((r) => [{ text: r.name, icon: r.icon }, money(r.net, true), orNone(r.profit_sold, true),
+      r.stock == null ? "–" : number.format(r.stock), orNone(r.stock_value), number.format(r.sold), orNone(r.each),
+      r.unit_cost == null ? "–" : money(r.unit_cost), orNone(r.margin, true), r.margin_share == null ? marginShareNote(r) || "–" : percent(r.margin_share),
+      number.format(r.listed), r.unsold_units ? `${number.format(r.unsold)} (${plural(r.unsold_units, "unit", "units")})` : number.format(r.unsold),
+      money(r.listing_fees), percent(r.sales_rate)]) };
   }
   return { columns: ["Time", "Total value", "Gold", "Other assets", "Equipped gear"], numeric: [1, 2, 3, 4],
     rows: data.value.points.map((p) => [formatTime(p.time), money(p.total), money(p.gold), money(p.assets), money(p.equipped)]) };

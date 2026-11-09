@@ -217,6 +217,13 @@ function F.CollectMail(before,after)
     end
 end
 
+-- Whether two mailbox reads can be compared. A mail that was read but is loading again
+-- would look collected, so more unreadable mails than before must be new arrivals. A
+-- mail the client never loads is just left out, so the others are still followed.
+function F.MailComparable(before,after)
+    return after.unreadable-before.unreadable<=math.max(after.count-before.count,0)
+end
+
 function F.ScanMail()
     if not F.context.mail then return end
     local count,total=F.Call(GetInboxNumItems)
@@ -226,10 +233,10 @@ function F.ScanMail()
         local mail=F.ReadMail(index)
         if mail then rows[#rows+1]=mail end
     end
-    -- A row still loading would look collected, so compare full reads only.
-    if #rows==count then
+    local read={count=count,unreadable=count-#rows}
+    if not F.mailSeen or F.MailComparable(F.mailRead,read) then
         if F.mailSeen then F.CollectMail(F.mailSeen,rows) end
-        F.mailSeen=rows
+        F.mailSeen,F.mailRead=rows,read
     end
     F.Snapshot("mail",rows,#rows==count and (not total or count>=total),{visible=count,total=total})
 end
@@ -302,11 +309,22 @@ local function backfillCluster(cluster,session,result)
         residual=residual,reconciliationIDs=ids},session.source,first)
 end
 
+-- 2: also follows reads where one mail never loaded. Running again skips what an
+-- earlier pass corrected, so nothing is recovered or voided twice.
+local BACKFILL_VERSION=2
+
 function F.BackfillMail()
     local db=F.db
-    if db.mailBackfilled then return end
-    db.mailBackfilled=true
-    local sessions,order,sales={},{},{}
+    local done=db.mailBackfilled==true and 1 or tonumber(db.mailBackfilled) or 0
+    if done>=BACKFILL_VERSION then return end
+    db.mailBackfilled=BACKFILL_VERSION
+    local sessions,order,sales,settled,voided={},{},{},{},{}
+    for _,e in ipairs(db.events) do
+        local d=e.data
+        if (e.kind=="mail_backfill" or e.kind=="vendor_backfill") and d.status=="applied" then
+            for _,id in ipairs(d.reconciliationIDs or {}) do settled[id]=true end
+        elseif e.kind=="activity" and d.correctsActivityID then voided[d.correctsActivityID]=true end
+    end
     local function sessionOf(e)
         local key=e.character..":"..tostring(e.session)
         if not sessions[key] then
@@ -319,19 +337,27 @@ function F.BackfillMail()
         local d=e.data
         if e.kind=="snapshot" and d.location=="mail" then
             local s=sessionOf(e)
-            if #d.rows==((d.metadata or {}).visible or #d.rows) then
-                if s.seen then
+            -- The same rule as ScanMail. Reads keep no record of the mailbox closing, so a
+            -- later visit that starts with a mail still loading begins afresh, as ScanMail
+            -- does on opening.
+            local count=(d.metadata or {}).visible or #d.rows
+            local read={count=count,unreadable=count-#d.rows}
+            local comparable=s.seen and F.MailComparable(s.read,read)
+            local fresh=s.seen and not comparable and e.time-s.readAt>BACKFILL_GAP
+            if not s.seen or comparable or fresh then
+                if comparable then
                     for _,mail in ipairs(F.MailTaken(s.seen,d.rows)) do
                         if mail.money>0 then s.found[#s.found+1]={mail=mail,time=e.time,amount=mail.money} end
                     end
                 end
-                s.seen=d.rows
+                s.seen,s.read=d.rows,read
             end
+            s.readAt=e.time
         elseif e.kind=="auction_sale" then sales[e.id]=e
-        elseif e.kind=="reconciliation" and d.status=="unresolved" then
+        elseif e.kind=="reconciliation" and d.status=="unresolved" and not settled[e.id] then
             local s=sessionOf(e)
             s.unresolved[#s.unresolved+1]=e
-        elseif e.kind=="activity" and (d.amount or 0)>0 then
+        elseif e.kind=="activity" and (d.amount or 0)>0 and not voided[e.id] then
             local mail=d.saleID and sales[d.saleID] and sales[d.saleID].data or d.category=="mail_received" and d
             if mail then
                 local s=sessionOf(e)
@@ -364,6 +390,58 @@ function F.BackfillMail()
     end
     if result.added+result.removed>0 and F.Print then
         F.Print("Recovered "..result.added.." missed mail collections from earlier records.")
+    end
+    return result
+end
+
+-- Earlier versions queued another vendor-sale intent each time a sell-junk loop used an
+-- item again, so the sales never added up to the gold received. Taken once per item and
+-- amount, the intents just before an unexplained gain are its sales only if they equal
+-- it to the copper.
+local VENDOR_LOOKBACK=30
+
+function F.RepairVendorSales()
+    local db=F.db
+    if db.vendorSalesRepaired then return end
+    db.vendorSalesRepaired=true
+    local settled,used,intents={},{},{}
+    for _,e in ipairs(db.events) do
+        local d=e.data
+        if (e.kind=="mail_backfill" or e.kind=="vendor_backfill") and d.status=="applied" then
+            for _,id in ipairs(d.reconciliationIDs or {}) do settled[id]=true end
+        elseif e.kind=="activity" and d.intentID then used[d.intentID]=true end
+    end
+    local result={added=0,amount=0}
+    for index=1,#db.events do
+        local e=db.events[index]
+        local d=e.data
+        if e.kind=="intent" and d.category=="vendor_sale" and not used[e.id] then
+            intents[e.character]=intents[e.character] or {}
+            table.insert(intents[e.character],e)
+        elseif e.kind=="reconciliation" and d.status=="unresolved" and (d.residual or 0)>0 and not settled[e.id] then
+            local seen,chosen,sum={},{},0
+            for _,i in ipairs(intents[e.character] or {}) do
+                if not used[i.id] and i.time<=e.time and e.time-i.time<=VENDOR_LOOKBACK then
+                    local item=i.data.details and i.data.details.item
+                    local key=tostring(item and item.link)..":"..i.data.amount
+                    if not seen[key] then seen[key]=true; chosen[#chosen+1]=i; sum=sum+i.data.amount end
+                end
+            end
+            if chosen[1] and sum==d.residual then
+                for _,i in ipairs(chosen) do
+                    local c=F.Copy(i.data.details or {})
+                    c.category,c.amount,c.confidence,c.intentID="vendor_sale",i.data.amount,"backfilled_intents",i.id
+                    backfillRecord("activity",c,e,e.time)
+                    used[i.id]=true
+                end
+                backfillRecord("vendor_backfill",{status="applied",added=#chosen,amount=sum,residual=d.residual,
+                    reconciliationIDs={e.id}},e,e.time)
+                result.added,result.amount=result.added+#chosen,result.amount+sum
+            end
+        end
+    end
+    if result.added>0 and F.Print then
+        F.Print("Recovered "..result.added.." missed vendor sales from earlier records.")
     end
     return result
 end
@@ -595,9 +673,18 @@ function F.InstallHooks()
         if not F.context.merchant then return end
         local info=F.Call(C_Container.GetContainerItemInfo,bag,slot)
         if info then
+            -- Sell-junk loops use the same slot again until the item has gone. One sale
+            -- is one intent, or the duplicates stop the batch from adding up.
+            for _,i in ipairs(F.intents) do
+                local d=i.event.data.details
+                if not i.used and F.Clock()-i.clock<i.window and i.event.data.category=="vendor_sale"
+                    and d and d.bag==bag and d.slot==slot and d.item and d.item.link==info.hyperlink then
+                    i.clock=F.Clock(); F.Touch(); return
+                end
+            end
             local item=F.Item(info.hyperlink,info.itemID)
             if item.vendorPrice then F.Intent("vendor_sale",item.vendorPrice*info.stackCount,
-                {item=item,quantity=info.stackCount}) end
+                {item=item,quantity=info.stackCount,bag=bag,slot=slot}) end
         end
     end)
     Hook(C_MerchantFrame,"SellAllJunkItems",function()
@@ -714,7 +801,7 @@ F.events={
     AUCTION_HOUSE_PURCHASE_COMPLETED=function(id) F.Emit("auction_purchase_confirmed",{auctionID=id}) end,
     MAIL_SHOW=function() F.context.mail=true; F.ScanMail() end,
     MAIL_INBOX_UPDATE=function() F.mailDirty=true end,
-    MAIL_CLOSED=function() F.context.mail=nil; F.mailSeen=nil; F.mailLeaving={} end,
+    MAIL_CLOSED=function() F.context.mail=nil; F.mailSeen,F.mailRead=nil,nil; F.mailLeaving={} end,
     MAIL_SUCCESS=function() F.mailDirty=true end,
     MAIL_FAILED=function() F.pendingSend=nil end,
     MAIL_SEND_SUCCESS=function()

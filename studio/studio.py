@@ -405,6 +405,30 @@ def get_item(app, body, query, source):
     return result
 
 
+@route("GET", r"/api/data/(\w+)/compare")
+def get_compare(app, body, query, source):
+    """Items side by side, and the items with activity in the window to choose from.
+    Each `name` is one item. Without `chosen`, nothing has been picked yet and the best
+    sellers are compared."""
+    reader = app.read_ledger(_source(source))
+    if not reader:
+        return {"empty": True}
+    window_id = query.get("window", ["all"])[0]
+    names = None
+    if "chosen" in query:
+        names = [name.strip()[:200] for name in query.get("name", [])[:analytics.MAX_COMPARED_ITEMS * 2]]
+    with reader as db:
+        try:
+            window = analytics.resolve_window(db, window_id)
+        except analytics.UnknownWindow:
+            if not db.execute("SELECT 1 FROM events LIMIT 1").fetchone():
+                return {"empty": True}
+            window = analytics.resolve_window(db, "all")
+        result = analytics.compare_figure(db, window, names)
+    app.icons.attach(result["items"], source)
+    return result
+
+
 def _item_id(query):
     try:
         item_id = int(query.get("id", [""])[0])
@@ -429,6 +453,26 @@ def get_visual_search(app, body, query, source):
         found += [dict(item, in_ledger=False) for item in app.tooltips.search(words, source)
                   if item["item_id"] not in known]
     return {"items": found, "online": app.tooltips.online}
+
+
+@route("GET", r"/api/visual/(\w+)/top")
+def get_visual_top(app, body, query, source):
+    """The items with the most sales, profit and loss in the window, with their icons."""
+    reader = app.read_ledger(_source(source))
+    if not reader:
+        return {"empty": True}
+    window_id = query.get("window", ["all"])[0]
+    with reader as db:
+        try:
+            window = analytics.resolve_window(db, window_id)
+        except analytics.UnknownWindow:
+            if not db.execute("SELECT 1 FROM events LIMIT 1").fetchone():
+                return {"empty": True}
+            window = analytics.resolve_window(db, "all")
+        result = analytics.top_items(db, window)
+    unique = {row["item_id"]: row for key in ("sales", "profit", "loss") for row in result[key]}
+    app.icons.attach(list(unique.values()), source)
+    return result
 
 
 @route("GET", r"/api/visual/(\w+)/item")

@@ -239,11 +239,35 @@ local function localIndex()
     return chars,checksum(F.JSON({l=F.db.accountLabel,c=chars}))
 end
 
+-- The recording marker: its name, or none once ended, and when that happened.
+local function markerState()
+    local at=F.db.markerAt or 0
+    if at>0 then return {n=F.db.episode,a=at} end
+end
+
 local function hello(source,target,isReply,ping)
     local st=state(source)
     local _,signature=localIndex()
     st.announcedCount,st.announcedSig=#F.db.history,signature
-    toPeer(source,target,{t="hello",n=#F.db.history,c=signature,r=isReply and 1 or nil,v=FEATURES},ping)
+    toPeer(source,target,{t="hello",n=#F.db.history,c=signature,r=isReply and 1 or nil,v=FEATURES,e=markerState()},ping)
+end
+
+local function adoptMarker(m,p)
+    local e=type(m.e)=="table" and m.e
+    local at=e and F.Number(e.a)
+    if not at or at<=0 then return end
+    local name=clean(e.n,250)
+    if name and not name:match("%S") then name=nil end
+    F.AdoptMarker(name,at,peerName(p))
+end
+
+-- Sent to every linked account online now. The others get it with their next hello.
+function F.ShareMarker()
+    local e=markerState()
+    if not e then return end
+    for source,st in pairs(states) do
+        if st.online and F.db.peers[source] then toPeer(source,st.online,{t="marker",e=e}) end
+    end
 end
 
 -- Tries the character seen last first; a reply cancels the remaining pings.
@@ -460,8 +484,14 @@ function handlers.hello(m,sender,p,st)
     st.signature=F.Number(m.c)
     st.features=F.Number(m.v)
     applyTotal(p,st,m.n)
+    -- Before replying, so the reply carries the marker both now share.
+    adoptMarker(m,p)
     if not m.r then hello(m.s,sender,true) end
     nextRequest(m.s)
+end
+
+function handlers.marker(m,sender,p)
+    adoptMarker(m,p)
 end
 
 function handlers.pull(m,sender)

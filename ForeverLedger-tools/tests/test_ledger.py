@@ -169,6 +169,44 @@ class AddonTests(unittest.TestCase):
         self.assertEqual([d["amount"] for d in self.kind("activity")],[100,200])
         self.assertEqual(self.kind("reconciliation")[0]["residual"],0)
 
+    def test_selling_the_same_slot_again_keeps_one_intent(self):
+        # A sell-junk loop calls UseContainerItem on every item until it has gone.
+        self.run_lua("""
+        BAGS[0]={{hyperlink="item:2770",itemID=2770,stackCount=2},{hyperlink="item:2771",itemID=2771,stackCount=1}}
+        F.InstallHooks(); F.context.merchant=true
+        for _=1,3 do C_Container.UseContainerItem(0,1) end
+        for _=1,2 do C_Container.UseContainerItem(0,2) end
+        F.ObserveBalance(100150); F.Flush()
+        """)
+        self.assertEqual(sorted(d["amount"] for d in self.kind("activity")),[50,100])
+        self.assertEqual(self.kind("reconciliation")[0]["residual"],0)
+
+    def old_junk_sale(self, received):
+        # Records as earlier versions left a sell-junk loop: one intent per retry, no sale.
+        self.run_lua("""
+        for _=1,3 do F.Intent("vendor_sale",100,{item={link="item:2770"},quantity=2}) end
+        for _=1,2 do F.Intent("vendor_sale",50,{item={link="item:2771"},quantity=1}) end
+        F.ObserveBalance(F.character.balance+%d); F.Flush()
+        F.db.vendorSalesRepaired=nil
+        """ % received)
+
+    def test_repair_recovers_junk_sales_the_repeated_intents_hid(self):
+        self.old_junk_sale(150)
+        self.assertEqual(self.kind("activity"),[])
+        self.run_lua('F.RepairVendorSales(); F.RepairVendorSales()')
+        self.assertEqual(sorted(a["amount"] for a in self.kind("activity")),[50,100])
+        self.assertEqual(self.kind("vendor_backfill")[0]["status"],"applied")
+
+    def test_repair_leaves_gold_the_intents_do_not_add_up_to(self):
+        self.old_junk_sale(149)
+        self.run_lua('F.RepairVendorSales()')
+        self.assertEqual(self.kind("activity"),[])
+
+    def test_repair_runs_once_from_login(self):
+        self.old_junk_sale(150)
+        self.run_lua('F.baselined=nil; F.Init(F.db,F.identity); F.db.vendorSalesRepaired=true; F.baselined=nil; F.Init(F.db,F.identity)')
+        self.assertEqual(sorted(a["amount"] for a in self.kind("activity")),[50,100])
+
     def test_failed_extra_intent_prevents_bulk_guess(self):
         self.run_lua('F.Intent("vendor_sale",100,{}); F.Intent("vendor_sale",200,{}); F.Intent("vendor_sale",500,{}); F.ObserveBalance(100300); F.Flush()')
         self.assertEqual(self.kind("activity"),[])
@@ -416,6 +454,26 @@ class AddonTests(unittest.TestCase):
         """)
         self.assertEqual(self.kind("activity"),[])
 
+    def test_mail_taken_while_another_stays_loading_is_collected(self):
+        self.run_lua("""
+        RETRIEVING_DATA="Retrieving data"
+        INBOX={{sender="Alt-Realm",subject="Gold",money=100},{sender="Bank-Realm",subject=RETRIEVING_DATA,money=900}}
+        F.context.mail=true; F.ScanMail()
+        INBOX[1].money=0; F.ScanMail()
+        table.remove(INBOX,1); F.ScanMail()
+        """)
+        self.assertEqual([(a["amount"],a["sender"]) for a in self.kind("activity")],[(100,"Alt-Realm")])
+
+    def test_mailbox_that_opens_empty_then_fills_with_a_mail_loading_is_followed(self):
+        self.run_lua("""
+        RETRIEVING_DATA="Retrieving data"
+        INBOX={}; F.events.MAIL_SHOW()
+        INBOX={{sender="Alt-Realm",subject="Gold",money=100},{sender="Bank-Realm",subject=RETRIEVING_DATA,money=900}}
+        F.ScanMail()
+        table.remove(INBOX,1); F.ScanMail()
+        """)
+        self.assertEqual([(a["amount"],a["sender"]) for a in self.kind("activity")],[(100,"Alt-Realm")])
+
     def test_returned_and_deleted_mail_is_not_income(self):
         self.run_lua("""
         ReturnInboxItem=function() end; DeleteInboxItem=function() end
@@ -547,6 +605,40 @@ class AddonTests(unittest.TestCase):
         F.BackfillMail()
         """)
         self.assertEqual(self.kind("activity"),[])
+
+    def never_loading_sale(self, money):
+        # A sale taken while another mail never loaded, so no read of the mailbox was complete.
+        self.run_lua("""
+        RETRIEVING_DATA="Retrieving data"; NOW=NOW+300; CLOCK=CLOCK+300
+        INBOX={SALE(%d),{subject=RETRIEVING_DATA,money=900}}
+        F.Snapshot("mail",{F.ReadMail(1)},false,{visible=2,total=2})
+        INBOX={{subject=RETRIEVING_DATA,money=900}}
+        F.Snapshot("mail",{},false,{visible=1,total=1})
+        F.ObserveBalance(F.character.balance+%d); F.Flush()
+        """ % (money, money))
+
+    def test_backfill_follows_reads_with_a_mail_that_never_loads(self):
+        self.old_mail_records()
+        self.never_loading_sale(300)
+        self.run_lua('F.BackfillMail()')
+        self.assertEqual([a["amount"] for a in self.kind("activity")],[300])
+
+    def test_backfill_runs_again_once_after_updating_without_repeating_corrections(self):
+        self.old_mail_records()
+        self.run_lua("""
+        INBOX={SALE(500),SALE(500)}; READ()
+        local paid=F.Copy(F.ReadMail(1)); paid.mode="money"
+        INBOX={SALE(500)}; READ()
+        F.Invoice(F.Copy(paid)); F.Invoice(F.Copy(paid))
+        F.ObserveBalance(100500); F.Flush()
+        F.BackfillMail()
+        NOW=NOW+600; CLOCK=CLOCK+600; INBOX={}; READ()
+        F.db.mailBackfilled=true
+        """)
+        self.never_loading_sale(300)
+        self.run_lua('F.BackfillMail(); F.BackfillMail()')
+        amounts=[a["amount"] for a in self.kind("activity")]
+        self.assertEqual(sorted(amounts),[-500,300,500,500])
 
     def test_backfill_runs_once_from_login(self):
         self.old_mail_records()

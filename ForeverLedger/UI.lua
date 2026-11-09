@@ -179,11 +179,51 @@ function F.RefreshScanStatus()
     if F.scanStatus then F.scanStatus:SetText(F.priceStatus or "Open the AH to refresh tracked item prices. Scans never buy or list items.") end
 end
 
+local function markerChanged()
+    if StaticPopup_Hide then StaticPopup_Hide("FOREVERLEDGER_MARKER") end
+    if F.ShareMarker then F.ShareMarker() end
+    if F.window and F.window:IsShown() and F.mode=="overview" and F.RefreshChart then F.RefreshChart() end
+end
+
+-- Setting the marker that is already running keeps it running, so setting it on
+-- each account by habit doesn't move its start.
 function F.SetMarker(text)
     local name=(text or ""):match("^%s*(.-)%s*$")
     if name=="" then return false end
-    F.Flush(); F.db.episode=name; F.Emit("episode_start",{name=name}); F.RecordValue(true)
-    F.Print("Marker: "..name); return true
+    if name==F.db.episode then F.Print("Marker "..name.." is already running."); return true end
+    F.Flush(); F.db.episode,F.db.markerAt=name,F.Now(); F.Emit("episode_start",{name=name}); F.RecordValue(true)
+    F.Print("Marker: "..name); markerChanged(); return true
+end
+
+function F.EndMarker()
+    if not F.db.episode then F.Print("No marker is running."); return false end
+    F.Flush(); F.Emit("episode_end",{}); F.db.episode,F.db.markerAt=nil,F.Now()
+    F.Print("Marker ended."); markerChanged(); return true
+end
+
+-- A linked account's marker: its name, or nil once ended, and when that happened.
+-- The latest change wins. The same name running on both keeps the earlier start,
+-- so both accounts count the episode from the same moment.
+function F.AdoptMarker(name,at,from)
+    local current,since=F.db.episode,F.db.markerAt or 0
+    local adopt
+    if name and name==current then adopt=at<since
+    else adopt=at>since or (at==since and (name or "")>(current or "")) end
+    if not adopt then return false end
+    if not name and not current then F.db.markerAt=at; return false end
+    F.Flush()
+    if name then
+        F.db.episode,F.db.markerAt=name,at
+        F.Emit("episode_start",{name=name,occurredAt=at,syncedFrom=from})
+        F.RecordValue(true)
+        F.Print("Marker from "..from..": "..name)
+    else
+        F.Emit("episode_end",{occurredAt=at,syncedFrom=from})
+        F.db.episode,F.db.markerAt=nil,at
+        F.Print("Marker ended on "..from..".")
+    end
+    markerChanged()
+    return true
 end
 
 function F.PopupEditBox(dialog) return dialog.GetEditBox and dialog:GetEditBox() or dialog.editBox or dialog.EditBox end
@@ -213,7 +253,7 @@ function F.Command(input)
         local name=F.FullName(rest); F.db.owners[name]=true; F.Emit("owner",{name=name}); F.Print("Owned character: "..name)
     elseif (command=="episode" or command=="marker") and rest~="" then F.SetMarker(rest)
     elseif command=="highlight" or command=="hl" then F.HighlightCommand(rest)
-    elseif command=="end" then F.Flush(); F.Emit("episode_end",{}); F.db.episode=nil
+    elseif command=="end" then F.EndMarker()
     elseif command=="export" then F.Show("export",tonumber(rest) or 1)
     elseif command=="journal" then F.Show("journal")
     elseif command=="scan" then F.ScanBags(true); F.ScanEquipment(); F.ScanBank(); F.ScanMail(); F.ScanAuctions(); F.RecordValue(); F.Show()
