@@ -153,11 +153,13 @@ textarea { width: 100%; resize: vertical; display: block; }
 .item-section.loading { opacity: .55; }
 .item-picker { margin: 22px 0 10px; }
 .item-picker h2 { font-size: 15px; font-weight: 600; margin-right: 6px; }
-.filters select.item-select { flex: 1; min-width: 0; max-width: 520px; }
+.filters select.item-select { flex: 1; min-width: 200px; max-width: 520px; }
 .item-controls { display: contents; }
 .compare-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .compare-chips:empty { display: none; }
 .filters select.compare-add { min-width: 220px; }
+.filters select.period-select { min-width: 150px; max-width: 220px; }
+.period-pair { display: inline-flex; gap: 10px; align-items: center; }
 .compare-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line-strong); border-radius: 4px; padding: 2px 2px 2px 6px; font-size: 13px; max-width: 260px; }
 .compare-chip .item-icon { width: 18px; height: 18px; }
 .compare-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

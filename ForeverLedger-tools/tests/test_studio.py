@@ -11,6 +11,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -1503,7 +1504,7 @@ class ItemComparisonTests(StudioTestCase):
         row = self.compare(e)
         self.assertEqual((row["sold"], row["each"], row["unit_cost"], row["margin"]), (1, 285, 100, 185))
         self.assertAlmostEqual(row["margin_share"], 1.85)
-        self.assertEqual((row["listed"], row["unsold"], row["unsold_units"], row["listing_fees"]), (1, 1, 3, 30))
+        self.assertEqual((row["listed"], row["auctions"], row["returned"], row["listing_fees"]), (4, 1, 3, 30))
         self.assertAlmostEqual(row["sales_rate"], 0.25)
         self.assertEqual(row["net"], 285 - 1000 - 30)
         # The nine still held cost 900 of that, so selling one made a profit.
@@ -1535,7 +1536,57 @@ class ItemComparisonTests(StudioTestCase):
         e.activity("auction_deposit", -60, 1600, item=self.CHAIN, quantity=5)  # Still up.
         found = analytics.ItemLedger(self.ledger(e)).analyse("Chain", 1000, 2000)
         self.assertEqual((found["spent"]["listing_fees"], found["spent"]["total"], found["net"]), (60, 60, -60))
-        self.assertEqual(found["listings"], {"listed": 2, "unsold": 1, "unsold_units": 5, "unknown_units": 0, "unpriced": 0})
+        self.assertEqual(found["listings"], {"listed": 2, "unsold": 1, "unpriced": 0, "listed_units": 10, "listed_unknown": 0,
+                                             "returned": 1, "returned_units": 5, "returned_unknown": 0})
+
+    def test_listings_and_the_sales_rate_count_units_not_auctions(self):
+        e = Events()
+        e.activity("auction_purchase", -5100, 1050, item=self.CHAIN, quantity=51)
+        self.post(e, "P:1", 1100, quantity=1, deposit=10, total=250)
+        self.post(e, "P:2", 1100, quantity=50, deposit=100, total=10000)
+        e.add("auction_outcome", {"auctionKey": "P:1", "item": self.CHAIN, "quantity": 1, "outcome": "expired",
+                                  "depositLost": 10}, 1500)
+        e.add("auction_outcome", {"auctionKey": "P:2", "item": self.CHAIN, "quantity": 50, "outcome": "sold"}, 1500)
+        self.sell(e, 1600, quantity=50, gross=10000, refund=100)
+        row = self.compare(e)
+        # One auction in two came back, but only one unit in 51.
+        self.assertEqual((row["listed"], row["auctions"], row["returned"]), (51, 2, 1))
+        self.assertAlmostEqual(row["sales_rate"], 50 / 51)
+
+    def test_a_listing_bigger_than_a_stack_comes_back_once_however_many_mails_it_takes(self):
+        e = Events()
+        self.post(e, "P:1", 1100, quantity=79, deposit=100, total=7900)
+        e.add("auction_outcome", {"auctionKey": "P:1", "item": self.CHAIN, "quantity": 79, "outcome": "expired",
+                                  "depositLost": 100}, 1500)
+        for at, units in ((1600, 20), (1600, 20), (1601, 20), (1601, 19)):
+            e.add("auction_return", {"item": self.CHAIN, "quantity": units, "failure": "expired",
+                                     "subject": "Auction expired: Chain (79)",
+                                     "items": [{"item": self.CHAIN, "quantity": units}]}, at)
+        row = self.compare(e)
+        self.assertEqual((row["listed"], row["returned"]), (79, 79))
+
+    def test_the_mail_shows_how_much_of_a_partly_sold_listing_came_back(self):
+        e = Events()
+        self.post(e, "P:1", 1100, quantity=10, deposit=100, total=5000)
+        self.sell(e, 1200, quantity=1, gross=500, refund=0)
+        e.add("auction_outcome", {"auctionKey": "P:1", "item": self.CHAIN, "quantity": 10, "outcome": "cancelled",
+                                  "depositLost": 100}, 1500)
+        e.add("auction_return", {"item": self.CHAIN, "quantity": 9, "failure": "expired",
+                                 "subject": "Auction expired: Chain (9)"}, 1600)
+        # A return of another listing no outcome was recorded for still counts.
+        e.add("auction_return", {"item": self.CHAIN, "quantity": 5, "failure": "expired",
+                                 "subject": "Auction expired: Chain (5)"}, 1050)
+        row = self.compare(e)
+        self.assertEqual((row["listed"], row["returned"], row["sold"]), (10, 14, 1))
+
+    def test_a_listing_marked_cancelled_whose_deposit_a_sale_gave_back_did_not_come_back(self):
+        e = Events()
+        self.post(e, "P:1", 1100, quantity=2, deposit=40, total=400)
+        e.add("auction_outcome", {"auctionKey": "P:1", "item": self.CHAIN, "quantity": 2, "outcome": "cancelled",
+                                  "depositLost": 40}, 1300)
+        self.sell(e, 1400, quantity=2, gross=400, refund=40)
+        row = self.compare(e)
+        self.assertEqual((row["listed"], row["returned"], row["sales_rate"]), (2, 0, 1.0))
 
     def test_figures_that_cannot_be_worked_out_are_none(self):
         e = Events()
@@ -1593,10 +1644,54 @@ class ItemComparisonTests(StudioTestCase):
         store.update_episode(db, episode, {"chart_settings": settings})
         saved = store.get_episode(db, episode)["chart_settings"]
         self.assertEqual((saved["item"]["view"], saved["compare"]["names"]), ("compare", ["Chain", "Ore"]))
+        periods = {"item": {"view": "periods"}, "periods": {"name": "Chain", "windows": ["day:2026-11-01", "all"]}}
+        store.update_episode(db, episode, {"chart_settings": periods})
+        saved = store.get_episode(db, episode)["chart_settings"]
+        self.assertEqual((saved["periods"]["name"], saved["periods"]["windows"]), ("Chain", ["day:2026-11-01", "all"]))
         for bad in ({"compare": {"names": "Chain"}}, {"compare": {"names": [""]}}, {"item": {"view": "both"}},
-                    {"compare": {"names": [f"Item {i}" for i in range(7)]}}):
+                    {"compare": {"names": [f"Item {i}" for i in range(7)]}}, {"periods": {"windows": ["all"]}},
+                    {"periods": {"windows": ["all", "all"]}}, {"periods": {"name": 3}}):
             with self.assertRaises(store.Invalid, msg=bad):
                 store.update_episode(db, episode, {"chart_settings": bad})
+
+
+class PeriodComparisonTests(StudioTestCase):
+    WINDOW, CHAIN = ItemComparisonTests.WINDOW, ItemComparisonTests.CHAIN
+    ledger, post, sell = ItemComparisonTests.ledger, ItemComparisonTests.post, ItemComparisonTests.sell
+
+    def marked(self):
+        e = Events()
+        e.add("episode_start", {"name": "Week 1"}, 1000)
+        e.activity("auction_purchase", -1000, 1050, item=self.CHAIN, quantity=10)
+        self.post(e, "P:1", 1100, quantity=4, deposit=40, total=1200)
+        e.add("auction_outcome", {"auctionKey": "P:1", "item": self.CHAIN, "quantity": 4, "outcome": "sold"}, 1200)
+        self.sell(e, 1200, quantity=4, gross=1200, refund=40)
+        e.add("episode_start", {"name": "Week 2"}, 2000)
+        self.post(e, "P:2", 2100, quantity=6, deposit=60, total=1200)
+        e.add("auction_outcome", {"auctionKey": "P:2", "item": self.CHAIN, "quantity": 6, "outcome": "expired",
+                                  "depositLost": 60}, 2500)
+        e.add("episode_start", {"name": "Week 3"}, 3000)
+        e.activity("vendor_sale", 10, 3500, item={"id": 1, "name": "Ore"}, quantity=1)
+        return self.ledger(e)
+
+    def test_one_item_is_compared_across_two_windows_earliest_first(self):
+        db = self.marked()
+        later, earlier = (analytics.resolve_window(db, f"marker:Week {n}") for n in (2, 1))
+        result = analytics.periods_figure(db, [later, earlier], "Chain")
+        self.assertEqual([row["window"]["id"] for row in result["items"]], ["marker:Week 1", "marker:Week 2"])
+        first, second = result["items"]
+        self.assertEqual((first["sold"], first["listed"], first["returned"], first["sales_rate"]), (4, 4, 0, 1.0))
+        self.assertEqual((second["sold"], second["listed"], second["returned"], second["sales_rate"]), (0, 6, 6, 0.0))
+        # Items are offered from both windows together, and the first is shown when none is chosen.
+        self.assertEqual(analytics.periods_figure(db, [earlier, later])["name"], "Chain")
+
+    def test_the_episode_window_is_compared_with_the_one_before_it(self):
+        db = self.marked()
+        ids = lambda found: [w["id"] for w in found]  # noqa: E731
+        self.assertEqual(ids(analytics.default_periods(db, "marker:Week 2")), ["marker:Week 1", "marker:Week 2"])
+        self.assertEqual(ids(analytics.default_periods(db, "marker:Week 1")), ["marker:Week 1"])
+        self.assertEqual(ids(analytics.default_periods(db, "all")), ["marker:Week 2", "marker:Week 3"])
+        self.assertEqual(ids(analytics.default_periods(db, "marker:Gone")), ["marker:Week 2", "marker:Week 3"])
 
 
 class MockDataTests(StudioTestCase):
@@ -1709,6 +1804,19 @@ class ServerTests(StudioTestCase):
         self.assertEqual([r["name"] for r in chosen["items"]], ["Linen Bag"])
         self.assertEqual(self.api("GET", "/api/data/mock/compare?window=all&chosen=1")["items"], [])
         self.assertEqual(self.api("GET", "/api/data/tbc/compare"), {"empty": True})
+
+    def test_period_comparison_uses_the_chosen_windows_or_the_episode_window_and_the_one_before(self):
+        windows = [w for w in self.api("GET", "/api/data/mock/windows")["windows"] if w["kind"] == "marker"]
+        first, second = windows[0]["id"], windows[1]["id"]
+        query = lambda pairs: urllib.parse.urlencode(pairs)  # noqa: E731
+        chosen = self.api("GET", "/api/data/mock/periods?" + query([("period", second), ("period", first), ("name", "Linen Bag")]))
+        self.assertEqual([r["window"]["id"] for r in chosen["items"]], [first, second])
+        self.assertEqual(chosen["name"], "Linen Bag")
+        self.assertTrue(all("icon" in r for r in chosen["items"]))
+        default = self.api("GET", "/api/data/mock/periods?" + query([("window", second), ("period", "marker:Gone"), ("period", first)]))
+        self.assertEqual([w["id"] for w in default["windows"]], [first, second])
+        self.assertEqual(default["name"], default["choices"][0]["name"])
+        self.assertEqual(self.api("GET", "/api/data/tbc/periods"), {"empty": True})
 
     def test_sources_stay_separate(self):
         mock = self.api("GET", "/api/data/mock/figures?window=all&range=to_date")

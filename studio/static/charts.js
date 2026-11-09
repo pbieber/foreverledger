@@ -11,6 +11,7 @@ export const CHARTS = {
   revenue: "Revenue breakdown",
   item: "Item analysis",
   compare: "Item comparison",
+  periods: "Item over two periods",
 };
 
 const C = {
@@ -827,17 +828,20 @@ export const percent = (share) => (share == null ? "–" : `${number.format(Math
 
 // The figures compared, in the order shown. `best` says which way is better, for the
 // columns where that is plain; how many were listed or came back depends on how many
-// were made, so those have none.
+// were made, so those have none. `note` is what goes under a value, if anything.
 const COMPARE_COLUMNS = [
   { key: "net", label: "Net profit", short: "Net profit", money: true, signed: true, best: "high" },
   { key: "profit_sold", label: "Profit on sold", short: "Profit on sold", money: true, signed: true, best: "high" },
   // The units held, with what they cost under them: where profit went when it was reinvested.
-  { key: "stock", label: "In stock", short: "In stock", note: "stock_value" },
+  { key: "stock", label: "In stock", short: "In stock",
+    note: (row) => (row.stock_value != null ? ["≈ ", { copper: row.stock_value }] : null) },
   { key: "sold", label: "Sold", short: "Sold", best: "high" },
   { key: "margin", label: "Margin each", short: "Margin each", money: true, signed: true, best: "high" },
   { key: "margin_share", label: "Margin % of cost", short: "Margin %", percent: true, best: "high" },
-  { key: "listed", label: "Listed", short: "Listed" },
-  { key: "unsold", label: "Unsold", short: "Unsold" },
+  // Units, so one big stack counts for more than a single one. The auctions go under.
+  { key: "listed", label: "Units listed", short: "Listed",
+    note: (row) => (row.auctions ? [plural(row.auctions, "auction", "auctions")] : null) },
+  { key: "returned", label: "Came back", short: "Came back" },
   { key: "sales_rate", label: "Sales rate", short: "Sales rate", percent: true, best: "high", meter: true },
 ];
 
@@ -883,8 +887,8 @@ function compareTip(row) {
       : [{ copper: row.unit_cost, label: `cost each on average${row.cost_partial ? ", some costs unknown" : ""}` }]),
     ...(row.margin == null ? [] : [{ copper: row.margin, signed: true, label: "margin each" }]),
     { text: percent(row.margin_share), label: row.margin_share == null ? `margin % of cost: ${marginShareNote(row).toLowerCase()}` : "margin as a share of cost" },
-    { text: count(row.listed), label: plural(row.listed, "auction listed", "auctions listed").replace(/^[\d,]+ /, "") },
-    { text: count(row.unsold), label: `came back unsold${row.unsold_units ? `, ${plural(row.unsold_units, "unit", "units")}` : ""}` },
+    { text: count(row.listed), label: `${row.listed === 1 ? "unit" : "units"} listed in ${plural(row.auctions, "auction", "auctions")}${row.listed_partial ? ", some with no quantity" : ""}` },
+    { text: count(row.returned), label: `${row.returned === 1 ? "unit" : "units"} came back unsold, expired or cancelled${row.rate_partial ? ", some with no quantity" : ""}` },
     ...(row.listing_fees ? [{ copper: row.listing_fees, label: "deposits kept on unsold listings" }] : []),
     { text: percent(row.sales_rate), label: row.sales_rate == null ? "sales rate: nothing sold or returned at auction" : `of auction units sold${row.rate_partial ? " (some returns had no quantity)" : ""}` },
   ];
@@ -892,15 +896,19 @@ function compareTip(row) {
 
 // One line per item, each figure in its column, and a meter for the sales rate. The
 // best of each column where better is plain sits on a highlight. A Short stacks a
-// card per item instead, as a table would be too narrow to read.
-function compareFigure(data, ctx, options) {
+// card per item instead, as a table would be too narrow to read. With `periods`, the
+// lines are one item in different windows, each named by its window.
+function compareFigure(data, ctx, options, periods = false) {
   const L = layoutFor(options), s = L.s;
   const rows = data.items ?? [];
-  const head = header(L, ctx, CHARTS.compare, `${plural(rows.length, "item", "items")}  ·  ${subtitleFor(ctx, data.window.start, data.window.end)}`);
+  const head = periods
+    ? header(L, ctx, data.name ?? CHARTS.periods, `${CHARTS.periods}  ·  ${rows.map((row) => row.window.label).join(" and ")}`, rows[0]?.icon ?? null)
+    : header(L, ctx, CHARTS.compare, `${plural(rows.length, "item", "items")}  ·  ${subtitleFor(ctx, data.window.start, data.window.end)}`);
+  const labelOf = (row) => (periods ? row.window.label : row.name);
   const area = { x: L.pad.left, y: head.bottom, w: L.innerW, h: L.H - L.pad.bottom - head.bottom };
   const axis = { start: 0, ignored: false };
   if (!rows.length) {
-    return { svg: shell(L, head.svg + emptyMessage(area, "Choose items to compare", s)), hover: null, anim: null, axis };
+    return { svg: shell(L, head.svg + emptyMessage(area, periods ? "Choose an item" : "Choose items to compare", s)), hover: null, anim: null, axis };
   }
   const best = bestRows(rows);
   const bars = [], hits = [];
@@ -939,7 +947,13 @@ function compareFigure(data, ctx, options) {
     bars.push({ x, y, width, height: h, radius: h / 2, from, to: Math.min(1, from + 0.3) });
     return out;
   }
+  // An item's icon and name, or a period's name with its dates under it.
   function itemLabel(x, y, box, row, width, size) {
+    if (periods) {
+      const when = `${formatTime(row.window.start)} to ${formatTime(row.window.end)}`, small = size * 0.72;
+      return text(x, y + box / 2 - small * 0.25, fit(labelOf(row), width - 4 * s, size), { size, weight: 600 })
+        + text(x, y + box / 2 + small * 1.05, fit(when, width - 4 * s, small), { size: small, fill: C.text2 });
+    }
     let out = "";
     if (row.icon) out += `<image x="${x}" y="${y}" width="${box}" height="${box}" href="${escapeXml(row.icon)}"/>`;
     out += `<rect x="${x}" y="${y}" width="${box}" height="${box}" rx="${2 * s}" fill="none" stroke="${C.axis}"/>`;
@@ -947,8 +961,8 @@ function compareFigure(data, ctx, options) {
     return out;
   }
 
-  // A cell's note under or beside its value: what the stock cost.
-  const noteOf = (row, col) => (col.note && row[col.key] && row[col.note] != null ? ["≈ ", { copper: row[col.note] }] : null);
+  // A cell's note under or beside its value, such as what the stock cost.
+  const noteOf = (row, col) => (col.note && row[col.key] ? col.note(row) : null);
   // The largest size up to `base` at which every value in these columns fits `room`,
   // with space for a highlight, and for a meter beside a sales rate.
   function fittedSize(base, cols, room) {
@@ -959,7 +973,7 @@ function compareFigure(data, ctx, options) {
     }));
     return size;
   }
-  const hit = (row, y, h) => ({ x: area.x, y, w: area.w, h, title: row.name, text: `net ${moneyWords(row.net, { signed: true })}`, rows: compareTip(row) });
+  const hit = (row, y, h) => ({ x: area.x, y, w: area.w, h, title: labelOf(row), text: `net ${moneyWords(row.net, { signed: true })}`, rows: compareTip(row) });
 
   let out = "";
   if (!L.tall) {
@@ -967,7 +981,7 @@ function compareFigure(data, ctx, options) {
     const colW = (area.w - nameW) / COMPARE_COLUMNS.length;
     const right = (k) => area.x + nameW + colW * (k + 1) - 4 * s;
     const headH = labelSize + 14 * s;
-    let headSvg = text(area.x, area.y + labelSize, "Item", { size: labelSize, weight: 600, fill: C.text3 });
+    let headSvg = text(area.x, area.y + labelSize, periods ? "Period" : "Item", { size: labelSize, weight: 600, fill: C.text3 });
     COMPARE_COLUMNS.forEach((col, k) => {
       headSvg += text(right(k), area.y + labelSize, fit(col.short, colW - 8 * s, labelSize), { size: labelSize, weight: 600, fill: C.text3, anchor: "end" });
     });
@@ -996,25 +1010,27 @@ function compareFigure(data, ctx, options) {
     });
   } else {
     // Four figures across and two down, under each item's name.
-    // Every gap is a share of the card, so six cramped cards keep their figures apart.
-    const gap = Math.min(16 * s, area.h * 0.015), cardH = Math.min(150 * s, (area.h - gap * (rows.length - 1)) / rows.length);
-    const nameH = cardH * 0.22, nameSize = Math.min(17 * s, nameH * 0.6), statH = (cardH - nameH) / 2;
-    const layout = [["net", "profit_sold", "stock", "sold"], ["margin", "margin_share", "unsold", "sales_rate"]];
+    // Every gap is a share of the card, so six cramped cards keep their figures apart,
+    // and a few cards grow to fill more of the Short.
+    const gap = Math.min(16 * s, area.h * 0.015), cardH = Math.min(180 * s, (area.h - gap * (rows.length - 1)) / rows.length);
+    const nameH = Math.min(cardH * 0.22, 40 * s), nameSize = Math.min(20 * s, nameH * 0.6), statH = (cardH - nameH) / 2;
+    const layout = [["net", "profit_sold", "stock", "sold"], ["margin", "margin_share", "returned", "sales_rate"]];
     const colW = area.w / layout[0].length;
-    const labelSize = Math.min(11 * s, statH * 0.24);
-    const size = fittedSize(Math.min(16 * s, statH * 0.4), COMPARE_COLUMNS, colW - 12 * s);
+    const labelSize = Math.min(13 * s, statH * 0.24);
+    const size = fittedSize(Math.min(22 * s, statH * 0.4), COMPARE_COLUMNS, colW - 12 * s);
     rows.forEach((row, i) => {
       const y = area.y + (cardH + gap) * i, box = nameH * 0.8;
       let card = itemLabel(area.x, y + (nameH - box) / 2, box, row, area.w, nameSize);
       layout.forEach((keys, r) => keys.forEach((key, k) => {
         const col = COMPARE_COLUMNS.find((c) => c.key === key);
         const x = area.x + colW * k, labelY = y + nameH + statH * r + statH * 0.08 + labelSize;
-        const label = key === "unsold" ? `Unsold of ${number.format(row.listed)} listed` : col.label;
+        const label = measure(col.label, labelSize, 600) <= colW - 16 * s ? col.label : col.short;
         card += text(x + 6 * s, labelY, fit(label, colW - 16 * s, labelSize), { size: labelSize, weight: 600, fill: C.text3 });
         const baseline = labelY + statH * 0.1 + size * 0.85;
         card += drawValue(x + 6 * s, baseline, row, col, size, "start");
         const after = x + 6 * s + runWidth(segmentsOf(row, col), size, 600, COIN_SCALE) + size * 0.5;
-        const note = noteOf(row, col), noteSize = size * 0.66;
+        // The units listed have no card of their own, so they go beside what came back.
+        const note = key === "returned" ? [`of ${number.format(row.listed)} listed`] : noteOf(row, col), noteSize = size * 0.66;
         if (note && after + runWidth(note, noteSize, 400, COIN_SCALE) <= x + colW - 8 * s) {
           card += run(after, baseline, note, { size: noteSize, fill: C.text2 });
         }
@@ -1032,8 +1048,9 @@ function compareFigure(data, ctx, options) {
 }
 
 const BUILDERS = { start: startFigure, auction: auctionFigure, value: valueFigure, item: itemFigure, compare: compareFigure,
+  periods: (data, ctx, options) => compareFigure(data, ctx, options, true),
   costs: (...args) => breakdownFigure("costs", ...args), revenue: (...args) => breakdownFigure("revenue", ...args) };
-const SCREEN = { start: { width: 1200, height: 500 }, auction: { width: 1200, height: 500 }, value: { width: 1200, height: 460 }, costs: { width: 1200, height: 500 }, revenue: { width: 1200, height: 500 }, item: { width: 1200, height: 500 }, compare: { width: 1200, height: 500 } };
+const SCREEN = { start: { width: 1200, height: 500 }, auction: { width: 1200, height: 500 }, value: { width: 1200, height: 460 }, costs: { width: 1200, height: 500 }, revenue: { width: 1200, height: 500 }, item: { width: 1200, height: 500 }, compare: { width: 1200, height: 500 }, periods: { width: 1200, height: 340 } };
 const EXPORT_SIZES = { short: { width: 1080, height: 1920, tall: true, scale: 2.1 }, long: { width: 1920, height: 1080, tall: false, scale: 1.6 } };
 
 // `tall` shows the vertical layout on screen, exactly as a Short's image has it.
@@ -1406,14 +1423,15 @@ export function tableFor(kind, data, settings) {
       ["Sales minus spending", "", money(d.net, true), ""],
     ] };
   }
-  if (kind === "compare") {
+  if (kind === "compare" || kind === "periods") {
     const orNone = (copper, signed = false) => (copper == null ? "–" : money(copper, signed && copper !== 0));
-    return { columns: ["Item", "Net profit", "Profit on sold", "In stock", "Stock at cost", "Sold", "Each, after the cut", "Cost each",
-      "Margin each", "Margin % of cost", "Listed", "Unsold", "Unsold listing fees", "Sales rate"], numeric: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
-    rows: (data.items ?? []).map((r) => [{ text: r.name, icon: r.icon }, money(r.net, true), orNone(r.profit_sold, true),
+    return { columns: [kind === "periods" ? "Period" : "Item", "Net profit", "Profit on sold", "In stock", "Stock at cost", "Sold", "Each, after the cut",
+      "Cost each", "Margin each", "Margin % of cost", "Units listed", "Came back", "Unsold listing fees", "Sales rate"], numeric: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+    rows: (data.items ?? []).map((r) => [kind === "periods" ? r.window.label : { text: r.name, icon: r.icon }, money(r.net, true), orNone(r.profit_sold, true),
       r.stock == null ? "–" : number.format(r.stock), orNone(r.stock_value), number.format(r.sold), orNone(r.each),
       r.unit_cost == null ? "–" : money(r.unit_cost), orNone(r.margin, true), r.margin_share == null ? marginShareNote(r) || "–" : percent(r.margin_share),
-      number.format(r.listed), r.unsold_units ? `${number.format(r.unsold)} (${plural(r.unsold_units, "unit", "units")})` : number.format(r.unsold),
+      `${number.format(r.listed)} (${plural(r.auctions, "auction", "auctions")})`,
+      number.format(r.returned),
       money(r.listing_fees), percent(r.sales_rate)]) };
   }
   return { columns: ["Time", "Total value", "Gold", "Other assets", "Equipped gear"], numeric: [1, 2, 3, 4],

@@ -56,8 +56,8 @@ CRAFT_SNAPSHOT_SECONDS = 30
 MAX_ITEM_CHOICES = 300
 MAX_COMPARED_ITEMS = 6
 # What an item's record holds: sales, purchases, own loot and crafts, auctions posted,
-# and auctions that came back unsold.
-RECORD_KEYS = ("sold", "bought", "farmed", "crafted", "listed", "unsold")
+# deposits kept on auctions that came back unsold, and the auctions that came back.
+RECORD_KEYS = ("sold", "bought", "farmed", "crafted", "listed", "unsold", "returned")
 # Snapshot places whose items count as stock, in the order a breakdown lists them.
 STOCK_PLACES = ("bags", "bank", "mail", "auctions")
 
@@ -457,12 +457,7 @@ def _lost_listing_fees(db, activities):
     timeline.sort(key=lambda row: (row[0], row[1]))
 
     refunded, sold = _deposits_not_lost(db, activities)
-    # An outcome may leave out what was listed. A later posting record can be a bare status change.
-    listed = {}
-    for data, in db.execute("SELECT data FROM events WHERE kind='auction_posted'"):
-        d = json.loads(data)
-        if d.get("item"):
-            listed[d.get("key")] = d
+    listed = _postings(db)
     unsold, losses = {}, []
     for moment, _, kind, d, character in timeline:
         key = (character, (d.get("item") or {}).get("name"), d.get("quantity"))
@@ -488,6 +483,90 @@ def _lost_listing_fees(db, activities):
             losses.append((moment, deposits.popleft() if deposits else None, character, d.get("item") or {},
                            d.get("quantity") or None))
     return losses
+
+
+def _postings(db):
+    """Each auction posted, by its key, with what was listed. An outcome may leave that
+    out, and a later posting record can be a bare status change, so those are skipped."""
+    posted = {}
+    for data, in db.execute("SELECT data FROM events WHERE kind='auction_posted'"):
+        d = json.loads(data)
+        if d.get("item"):
+            posted[d.get("key")] = d
+    return posted
+
+
+STACK_IN_SUBJECT = re.compile(r"\((\d+)\)\s*$")
+
+
+def _returned_listings(db, activities):
+    """Each listing that came back without selling: (time, character, item, units), with
+    units None when the quantity isn't known.
+
+    An auction the house identified counts by its last outcome, as one marked cancelled
+    can turn out sold. Earlier addon versions marked sales and expiries cancelled too, so
+    the deposit a sale gave back says how much of a lost one really sold (see
+    `_deposits_not_lost`), and a partly sold commodity counts only the units left. Units
+    come from the outcome or else its posting.
+
+    A listing comes back as a mail per stack, each with the units that came back in its
+    subject, as "Auction expired: Mild Spices (79)". A mail names its auction only
+    sometimes. One that doesn't belongs to the earliest outcome for the same character and
+    item at or before it that was listed with at least that many units and isn't yet
+    accounted for, and the units mailed replace the outcome's own count, as they show
+    what really came back. Only what no outcome takes counts on its own.
+    """
+    refunded, sold = _deposits_not_lost(db, activities)
+    posted, last = _postings(db), {}
+    for moment, character, data in db.execute(
+            "SELECT time,character,data FROM events WHERE kind='auction_outcome' ORDER BY time,id"):
+        d = json.loads(data)
+        if d.get("auctionKey"):
+            last[d["auctionKey"]] = (moment, character, d)
+    outcomes, waiting = [], defaultdict(list)
+    for key, (moment, character, d) in last.items():
+        if d.get("outcome") not in ("expired", "cancelled") or key in sold:
+            continue
+        posting = posted.get(key, {})
+        item = d.get("item") or posting.get("item") or {}
+        stack = d.get("quantity") or posting.get("quantity") or None
+        lost = d.get("depositLost")
+        if lost and refunded[key] >= lost:
+            continue  # A sale gave the whole deposit back.
+        units = round(stack * (lost - refunded[key]) / lost) if lost and stack else stack
+        if units == 0:
+            continue
+        outcome = {"time": moment, "character": character, "item": item, "units": units, "stack": stack, "mailed": 0}
+        outcomes.append(outcome)
+        if stack:
+            waiting[(character, item.get("name"))].append(outcome)
+    for claims in waiting.values():
+        claims.sort(key=lambda outcome: outcome["time"])
+    returned = []
+    for moment, character, data in db.execute(
+            "SELECT time,character,data FROM events WHERE kind='auction_return' ORDER BY time,id"):
+        d = json.loads(data)
+        if d.get("auctionKey") in last:
+            continue
+        item = d.get("item") or {}
+        stacks = [i.get("quantity") or 0 for i in d.get("items") or [] if (i.get("item") or {}).get("id") == item.get("id")]
+        units = sum(stacks) or d.get("quantity") or None
+        left = STACK_IN_SUBJECT.search(d.get("subject") or "")
+        size = int(left.group(1)) if left else units
+        if not d.get("auctionKey") and units:
+            for outcome in waiting.get((character, item.get("name")), []):
+                room = outcome["stack"] - outcome["mailed"]
+                if outcome["time"] <= moment and size <= outcome["stack"] and room > 0:
+                    take = min(room, units)
+                    outcome["mailed"], units = outcome["mailed"] + take, units - take
+                    if not units:
+                        break
+            if units == 0:
+                continue
+        returned.append((moment, character, item, units))
+    returned += [(o["time"], o["character"], o["item"], o["mailed"] or o["units"]) for o in outcomes]
+    returned.sort(key=lambda row: row[0])
+    return returned
 
 
 def cost_figure(db, window):
@@ -763,11 +842,14 @@ class ItemLedger:
         self._bag_index = None
         refunds = []
         activities = _activities(db)
+        posted = _postings(db)
         for moment, d, _ in activities:
             category, item = d.get("category"), d.get("item") or {}
             name = self._name(item)
             if category == "auction_deposit" and name:
-                self._record(name, item)["listed"].append({"time": moment, "deposit": -(d.get("amount") or 0)})
+                units = d.get("quantity") or posted.get(d.get("auctionKey"), {}).get("quantity") or None
+                self._record(name, item)["listed"].append({"time": moment, "deposit": -(d.get("amount") or 0),
+                                                           "units": units})
             elif category in ITEM_SOLD and name:
                 if category == "auction_sale":
                     commission = d.get("commission") or 0
@@ -801,6 +883,10 @@ class ItemLedger:
             name = self._name(item)
             if name:
                 self._record(name, item)["unsold"].append({"time": moment, "fee": copper, "units": units})
+        for moment, _, item, units in _returned_listings(db, activities):
+            name = self._name(item)
+            if name:
+                self._record(name, item)["returned"].append({"time": moment, "units": units})
 
         for source, character, sequence, moment, data in db.execute(
                 "SELECT source_id,character,sequence,time,data FROM events WHERE kind='loot_message' "
@@ -1002,7 +1088,7 @@ class ItemLedger:
         bought_cost = sum(b["cost"] for b in inside["bought"])
         materials = sum(r["cost"] for r in reagents)
         revenue = sum(s["revenue"] for s in sold)
-        unsold = inside["unsold"]
+        unsold, returned = inside["unsold"], inside["returned"]
         fees = sum(u["fee"] or 0 for u in unsold)
         # Units that went into crafting other items are part of those items' cost, so their
         # cost comes off here. It never takes off more than was spent on the item here.
@@ -1029,9 +1115,12 @@ class ItemLedger:
                      "into": [{"name": product, "units": units} for product, units
                               in sorted(into.items(), key=lambda pair: (-pair[1], pair[0]))]},
             "listings": {"listed": len(inside["listed"]), "unsold": len(unsold),
-                         "unsold_units": sum(u["units"] or 0 for u in unsold),
-                         "unknown_units": sum(1 for u in unsold if not u["units"]),
-                         "unpriced": sum(1 for u in unsold if u["fee"] is None)},
+                         "unpriced": sum(1 for u in unsold if u["fee"] is None),
+                         "listed_units": sum(r["units"] or 0 for r in inside["listed"]),
+                         "listed_unknown": sum(1 for r in inside["listed"] if not r["units"]),
+                         "returned": len(returned),
+                         "returned_units": sum(r["units"] or 0 for r in returned),
+                         "returned_unknown": sum(1 for r in returned if not r["units"])},
             "recipe": None if not recipe else {"makes": recipe["makes"], "seen": recipe["seen"], "reagents": reagents},
             "materials_unknown": bool(crafts) and (not recipe or any(r["unit_cost"] is None for r in reagents)),
             "net": revenue - bought_cost - materials - fees + credited,
@@ -1048,16 +1137,17 @@ class ItemLedger:
         span's end, valued at that same cost, is what the difference went into. Each sold
         for is the average a unit brought in after the auction house cut, and the margin
         is that less the average cost per unit up to the span's end (see `unit_cost`).
-        The sales rate is the share of auction units
-        that sold, of those that sold or came back unsold in the span. None where a figure
-        can't be worked out.
+        Listings count units: those put up in the span, and those that came back in it
+        (see `_returned_listings`). The sales rate is the share of auction units that sold, of
+        those that sold or came back in the span, so a big stack that sold outweighs a
+        single one that didn't. None where a figure can't be worked out.
         """
         found = self.analyse(name, start, end)
         sold, listings = found["sold"], found["listings"]
         each = sold["revenue"] / sold["quantity"] if sold["quantity"] else None
         cost = self.unit_cost(name, end)
         margin = None if each is None or cost is None else each - cost
-        finished = sold["auction"] + listings["unsold_units"]
+        finished = sold["auction"] + listings["returned_units"]
         places = self.stock(name, end)
         units = None if places is None else sum(places.values())
         fees = found["spent"]["listing_fees"]
@@ -1071,11 +1161,13 @@ class ItemLedger:
             "each": None if each is None else round(each), "unit_cost": None if cost is None else round(cost),
             "margin": None if margin is None else round(margin),
             "margin_share": None if margin is None or not cost else margin / cost,
-            "listed": listings["listed"], "unsold": listings["unsold"], "unsold_units": listings["unsold_units"],
+            "listed": listings["listed_units"], "auctions": listings["listed"],
+            "returned": listings["returned_units"], "returned_auctions": listings["returned"],
+            "listed_partial": bool(listings["listed_unknown"]),
             "sales_rate": sold["auction"] / finished if finished else None,
             "spent": found["spent"]["total"], "listing_fees": fees,
             "cost_partial": found["materials_unknown"] or self._cost_partial(name, end),
-            "rate_partial": bool(listings["unknown_units"]),
+            "rate_partial": bool(listings["returned_unknown"]),
             "has_activity": found["has_activity"],
         }
 
@@ -1139,6 +1231,35 @@ def compare_figure(db, window, names=None):
         chosen = list(dict.fromkeys(n for n in names if n))[:MAX_COMPARED_ITEMS]
     return {"window": window, "choices": choices, "limit": MAX_COMPARED_ITEMS,
             "items": [items.compare(name, start, end) for name in chosen]}
+
+
+def default_periods(db, window_id):
+    """Two windows to compare an item across, starting from an episode's window: the
+    window of the same kind just before it, then it. Everything has nothing before it,
+    so the last two markers are compared, or else the last two days. Fewer than two
+    windows of a kind gives what there is."""
+    found = windows(db)
+    current = next((w for w in found if w["id"] == window_id), None)
+    if current and current["kind"] != "all":
+        earlier = [w for w in found if w["kind"] == current["kind"] and w["start"] < current["start"]]
+        before = max(earlier, key=lambda w: w["start"], default=None)
+        return [w for w in (before, current) if w]
+    for kind in ("marker", "day"):
+        same = sorted((w for w in found if w["kind"] == kind), key=lambda w: w["start"])
+        if len(same) >= 2:
+            return same[-2:]
+    return [w for w in found if w["kind"] == "all"]
+
+
+def periods_figure(db, periods, name=None):
+    """One item in two windows side by side, earliest first, and the items worth choosing
+    from, which are those with activity in either. With no name, the first of them."""
+    items = ItemLedger(db)
+    periods = sorted(periods, key=lambda w: (w["start"], w["end"]))
+    choices = _item_choices(items, min(w["start"] for w in periods), max(w["end"] for w in periods))
+    name = name or (choices[0]["name"] if choices else None)
+    rows = [dict(items.compare(name, w["start"], w["end"]), window=w) for w in periods] if name else []
+    return {"windows": periods, "choices": choices, "name": name, "items": rows}
 
 
 TOP_ITEMS = 6

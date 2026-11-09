@@ -11,8 +11,8 @@ from pathlib import Path
 FORMATS = ("short", "long")
 STATUSES = ("idea", "scripting", "recording", "editing", "published")
 SOURCES = ("forever", "tbc", "mock")
-CHARTS = ("", "start", "auction", "value", "costs", "revenue", "item", "compare")
-ITEM_VIEWS = ("one", "compare")
+CHARTS = ("", "start", "auction", "value", "costs", "revenue", "item", "compare", "periods")
+ITEM_VIEWS = ("one", "compare", "periods")
 VALUE_PARTS = ("total", "gold", "assets", "equipped")
 MAX_COMPARED = 6
 RANGES = ("window", "to_date")
@@ -82,8 +82,8 @@ def _choice(value, choices, field):
 def _chart_settings(value):
     """Per chart: where its vertical axis starts, how long its animation runs, for the
     value chart whether it shows the total or one part, for the
-    item chart which item it shows and whether it compares items instead, and for the
-    comparison which items, in order."""
+    item chart which item it shows and whether it compares items or periods instead, for
+    the comparison which items, in order, and for the periods which item and windows."""
     if not isinstance(value, dict) or not set(value) <= set(CHARTS) - {""}:
         raise Invalid("Chart settings are not valid")
     clean = {}
@@ -125,6 +125,18 @@ def _chart_settings(value):
                     or not all(isinstance(n, str) and 0 < len(n) <= 200 for n in names)):
                 raise Invalid("The items to compare are not valid")
             entry["names"] = list(dict.fromkeys(names))
+        if chart == "periods" and "name" in settings:
+            name = settings["name"]
+            if not isinstance(name, str) or len(name) > 200:
+                raise Invalid("The item name is not valid")
+            entry["name"] = name
+        if chart == "periods" and "windows" in settings:
+            # Two windows by ID, or none to start from the episode's window again.
+            chosen = settings["windows"]
+            if (not isinstance(chosen, list) or len(chosen) not in (0, 2) or len(set(chosen)) != len(chosen)
+                    or not all(isinstance(w, str) and 0 < len(w) <= 300 for w in chosen)):
+                raise Invalid("The periods to compare are not valid")
+            entry["windows"] = chosen
         clean[chart] = entry
     return json.dumps(clean)
 

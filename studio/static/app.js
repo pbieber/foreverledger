@@ -606,10 +606,6 @@ async function renderData(pane, episode) {
   pane.replaceChildren(filters, figures);
 
   async function drawFilters(windows) {
-    const windowOptions = (kind, heading) => {
-      const items = windows.filter((w) => w.kind === kind);
-      return items.length ? h("optgroup", { label: heading }, items.map((w) => h("option", { value: w.id, selected: w.id === episode.window }, w.label))) : null;
-    };
     filters.replaceChildren(...[
       h("div", { class: "segmented", role: "group", "aria-label": "Data source" }, SOURCES.map(([id, text]) => h("button", { "aria-pressed": String(episode.source === id),
         onclick: async () => {
@@ -617,13 +613,15 @@ async function renderData(pane, episode) {
           // Windows and items belong to one source, so a new source starts afresh.
           const { name, ...item } = episode.chart_settings.item ?? {};
           const { names, ...compare } = episode.chart_settings.compare ?? {};
-          const chart_settings = { ...episode.chart_settings, ...(name === undefined ? {} : { item }), ...(names === undefined ? {} : { compare }) };
+          const { name: _, windows: __, ...periods } = episode.chart_settings.periods ?? {};
+          const chart_settings = { ...episode.chart_settings, ...(name === undefined ? {} : { item }), ...(names === undefined ? {} : { compare }),
+            ...(episode.chart_settings.periods ? { periods } : {}) };
           await patch({ source: id, window: "all", chart_settings });
           await draw();
         } }, text))),
       windows.length ? h("span", { class: "filter-label" }, "Window") : null,
       windows.length ? h("select", { "aria-label": "Window", onchange: async (e) => { await patch({ window: e.target.value }); await draw(); } },
-        windowOptions("marker", "Episode markers"), windowOptions("day", "Calendar days"), windowOptions("all", "Everything")) : null,
+        windowOptions(windows, episode.window)) : null,
       windows.length ? h("div", { class: "segmented", role: "group", "aria-label": "Range for the line charts" },
         [["window", "This window"], ["to_date", "All up to its end"]].map(([id, text]) => h("button", { "aria-pressed": String(episode.range === id),
           onclick: async () => { await patch({ range: id }); await draw(); } }, text))) : null,
@@ -660,9 +658,17 @@ async function renderData(pane, episode) {
       highlightsCard(data.highlights || [], data.window),
       // A server started before a chart existed doesn't send it; the others still draw.
       ...["start", "auction", "value", "revenue", "costs"].filter((kind) => data[kind]).map((kind) => figureCard(kind, data, ctx, episode)),
-      itemSection(episode, ctx));
+      itemSection(episode, ctx, windows));
   }
   await draw();
+}
+
+// The windows to choose from, grouped by kind, with `selected` chosen.
+function windowOptions(windows, selected) {
+  return [["marker", "Episode markers"], ["day", "Calendar days"], ["all", "Everything"]].map(([kind, heading]) => {
+    const items = windows.filter((w) => w.kind === kind);
+    return items.length ? h("optgroup", { label: heading }, items.map((w) => h("option", { value: w.id, selected: w.id === selected }, w.label))) : null;
+  }).filter(Boolean);
 }
 
 // ---------- Item analysis ----------
@@ -682,12 +688,14 @@ function saveChartSetting(episode, kind, changes) {
   saveLater(`charts-${episode.id}`, () => api("PATCH", `/api/episodes/${episode.id}`, { chart_settings: episode.chart_settings }));
 }
 
-// One item analysed, or several compared side by side, chosen per episode.
-function itemSection(episode, ctx) {
+// One item analysed, several compared side by side, or one compared across two
+// periods, chosen per episode.
+const ITEM_VIEWS = [["one", "One item", oneItem], ["compare", "Compare items", compareItems], ["periods", "Compare periods", comparePeriods]];
+function itemSection(episode, ctx, windows) {
   const controls = h("div", { class: "item-controls" });
   const body = h("div");
   const view = () => episode.chart_settings.item?.view ?? "one";
-  const viewButtons = [["one", "One item"], ["compare", "Compare items"]].map(([id, text]) => h("button", { onclick: () => {
+  const viewButtons = ITEM_VIEWS.map(([id, text]) => h("button", { onclick: () => {
     if (view() === id) return;
     saveChartSetting(episode, "item", { view: id });
     show();
@@ -697,10 +705,11 @@ function itemSection(episode, ctx) {
       h("div", { class: "segmented", role: "group", "aria-label": "Item view" }, viewButtons), controls), body);
 
   function show() {
-    viewButtons.forEach((button, i) => button.setAttribute("aria-pressed", String((i === 1) === (view() === "compare"))));
+    const shown = ITEM_VIEWS.find(([id]) => id === view()) ?? ITEM_VIEWS[0];
+    viewButtons.forEach((button, i) => button.setAttribute("aria-pressed", String(ITEM_VIEWS[i] === shown)));
     controls.replaceChildren();
     body.replaceChildren();
-    (view() === "compare" ? compareItems : oneItem)(episode, ctx, section, controls, body);
+    shown[2](episode, ctx, section, controls, body, windows);
   }
   show();
   return section;
@@ -780,6 +789,59 @@ function compareItems(episode, ctx, section, controls, body) {
   picker.addEventListener("change", () => {
     if (picker.value) choose([...shown, picker.value]);
   });
+  load();
+}
+
+// One item in two windows, earlier above later. Until two are chosen, the episode's
+// window is compared with the one of its kind before it.
+function comparePeriods(episode, ctx, section, controls, body, windows) {
+  const picker = h("select", { class: "item-select", "aria-label": "Item to compare across periods", disabled: true });
+  const first = h("select", { class: "period-select", "aria-label": "First period", disabled: true });
+  const second = h("select", { class: "period-select", "aria-label": "Second period", disabled: true });
+  controls.replaceChildren(h("span", { class: "filter-label" }, "Item"), picker,
+    h("span", { class: "period-pair" }, h("span", { class: "filter-label" }, "Periods"), first, h("span", { class: "filter-label" }, "and"), second));
+  let latest = 0;
+
+  // Only the latest load is shown, as an earlier one can finish after it.
+  async function load() {
+    const ticket = ++latest;
+    section.classList.add("loading");
+    const saved = episode.chart_settings.periods ?? {};
+    const params = new URLSearchParams({ window: episode.window, name: saved.name ?? "" });
+    (saved.windows ?? []).forEach((id) => params.append("period", id));
+    const result = await attempt(() => api("GET", `/api/data/${episode.source}/periods?${params}`));
+    if (ticket !== latest) return;
+    section.classList.remove("loading");
+    if (!result || result.empty || !picker.isConnected) return;
+    const [one, two] = result.windows;
+    first.replaceChildren(...windowOptions(windows, one?.id));
+    second.replaceChildren(...windowOptions(windows, (two ?? one)?.id));
+    first.disabled = second.disabled = windows.length < 2;
+    const options = result.choices.map((choice) => h("option", { value: choice.name, selected: choice.name === result.name }, choiceLabel(choice)));
+    if (result.name && !result.choices.some((choice) => choice.name === result.name)) {
+      options.unshift(h("option", { value: result.name, selected: true }, `${result.name}  ·  nothing in these periods`));
+    }
+    picker.replaceChildren(...options);
+    picker.disabled = !options.length;
+    body.replaceChildren(result.items.length
+      ? figureCard("periods", { windows: result.windows, name: result.name, items: result.items }, ctx, episode)
+      : h("p", { class: "hl-empty" }, "No item was sold, farmed, crafted or bought in these periods."));
+  }
+
+  picker.addEventListener("change", () => {
+    saveChartSetting(episode, "periods", { name: picker.value });
+    load();
+  });
+  const choosePeriods = () => {
+    if (first.value === second.value) {
+      body.replaceChildren(h("p", { class: "hl-empty" }, "Choose two different periods to compare."));
+      return;
+    }
+    saveChartSetting(episode, "periods", { windows: [first.value, second.value] });
+    load();
+  };
+  first.addEventListener("change", choosePeriods);
+  second.addEventListener("change", choosePeriods);
   load();
 }
 
@@ -1037,7 +1099,7 @@ function figureCard(kind, data, ctx, episode) {
       playButton, scrubber, durationSelect,
       h("div", { class: "segmented", role: "group", "aria-label": "Chart layout" }, viewButtons),
       // Bars of cost and item counts always start from nothing, so those have no axis choice.
-      ...(breakdown || kind === "item" || kind === "compare" ? [] : [
+      ...(breakdown || ["item", "compare", "periods"].includes(kind) ? [] : [
         h("span", { class: "foot-label" }, "Axis from"),
         h("div", { class: "segmented", role: "group", "aria-label": "Where the vertical axis starts" }, axisButtons),
         customField, axisWarning]),

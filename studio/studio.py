@@ -429,6 +429,32 @@ def get_compare(app, body, query, source):
     return result
 
 
+@route("GET", r"/api/data/(\w+)/periods")
+def get_periods(app, body, query, source):
+    """One item in two windows side by side. The two `period` windows are those chosen;
+    without both, the episode's `window` and the one before it are compared."""
+    reader = app.read_ledger(_source(source))
+    if not reader:
+        return {"empty": True}
+    window_id = query.get("window", ["all"])[0]
+    chosen = list(dict.fromkeys(query.get("period", [])))[:2]
+    name = query.get("name", [""])[0].strip()[:200] or None
+    with reader as db:
+        if not db.execute("SELECT 1 FROM events LIMIT 1").fetchone():
+            return {"empty": True}
+        periods = []
+        for period in chosen:
+            try:
+                periods.append(analytics.resolve_window(db, period))
+            except analytics.UnknownWindow:
+                pass
+        if len(periods) < 2:
+            periods = analytics.default_periods(db, window_id)
+        result = analytics.periods_figure(db, periods, name)
+    app.icons.attach(result["items"], source)
+    return result
+
+
 def _item_id(query):
     try:
         item_id = int(query.get("id", [""])[0])
