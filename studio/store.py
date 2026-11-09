@@ -13,6 +13,7 @@ STATUSES = ("idea", "scripting", "recording", "editing", "published")
 SOURCES = ("forever", "tbc", "mock")
 CHARTS = ("", "start", "auction", "value", "costs", "revenue", "item", "compare")
 ITEM_VIEWS = ("one", "compare")
+VALUE_PARTS = ("total", "gold", "assets", "equipped")
 MAX_COMPARED = 6
 RANGES = ("window", "to_date")
 AXIS_MODES = ("zero", "fit", "custom")
@@ -80,6 +81,7 @@ def _choice(value, choices, field):
 
 def _chart_settings(value):
     """Per chart: where its vertical axis starts, how long its animation runs, for the
+    value chart whether it shows the total or one part, for the
     item chart which item it shows and whether it compares items instead, and for the
     comparison which items, in order."""
     if not isinstance(value, dict) or not set(value) <= set(CHARTS) - {""}:
@@ -111,6 +113,9 @@ def _chart_settings(value):
             if not isinstance(name, str) or len(name) > 200:
                 raise Invalid("The item name is not valid")
             entry["name"] = name
+        if chart == "value" and "show" in settings:
+            # The total, or one of the parts it adds up on its own.
+            entry["show"] = _choice(settings["show"], VALUE_PARTS, "Value chart")
         if chart == "item" and "view" in settings:
             # The item section shows one item, or several side by side.
             entry["view"] = _choice(settings["view"], ITEM_VIEWS, "Item view")

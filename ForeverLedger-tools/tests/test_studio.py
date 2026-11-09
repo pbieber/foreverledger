@@ -174,6 +174,14 @@ class ChartSettingsTests(StudioTestCase):
             with self.assertRaises(store.Invalid, msg=bad):
                 store.update_episode(self.db, self.episode, {"chart_settings": bad})
 
+    def test_the_value_chart_keeps_which_part_it_shows(self):
+        store.update_episode(self.db, self.episode, {"chart_settings": {"value": {"show": "gold"}}})
+        saved = store.get_episode(self.db, self.episode)["chart_settings"]
+        self.assertEqual(saved["value"], {"mode": "zero", "gold": 0, "seconds": 3, "show": "gold"})
+        for bad in ({"value": {"show": "silver"}}, {"value": {"show": 1}}):
+            with self.assertRaises(store.Invalid, msg=bad):
+                store.update_episode(self.db, self.episode, {"chart_settings": bad})
+
     def test_the_revenue_chart_keeps_its_own_character_split(self):
         settings = {"revenue": {"split": True, "characters": ["Player-2"]}, "costs": {"split": False}}
         store.update_episode(self.db, self.episode, {"chart_settings": settings})

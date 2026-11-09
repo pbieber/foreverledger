@@ -1,4 +1,4 @@
-import { attachHover, breakdownGroups, CHARTS, createFrames, exportPng, formatTime, moneyNode, moneyWords, renderForScreen, renderVideo, saveBlob, tableFor, VIDEO_HOLD_SECONDS, VideoCancelled } from "./charts.js";
+import { attachHover, breakdownGroups, CHARTS, createFrames, exportPng, formatTime, moneyNode, moneyWords, renderForScreen, renderVideo, saveBlob, tableFor, VALUE_PARTS, valuePart, VIDEO_HOLD_SECONDS, VideoCancelled } from "./charts.js";
 import { COINS } from "./coins.js";
 import { drawVisual, QUALITY_COLORS, shownLines, valueWords, visualBlob } from "./visuals.js";
 
@@ -990,7 +990,9 @@ function figureCard(kind, data, ctx, episode) {
 
   const size = episode.format === "short" ? "1080 \u00d7 1920" : "1920 \u00d7 1080";
   const shape = episode.format === "short" ? "vertical" : "widescreen";
-  const fileName = (extension) => `${`${episode.title}-${kind}-${episode.source}`.replace(/[^\w-]+/g, "-").toLowerCase()}.${extension}`;
+  // A value chart showing one part says which in its file name.
+  const chartName = () => (kind === "value" && valuePart(settings()) !== "total" ? `${kind}-${valuePart(settings())}` : kind);
+  const fileName = (extension) => `${`${episode.title}-${chartName()}-${episode.source}`.replace(/[^\w-]+/g, "-").toLowerCase()}.${extension}`;
   const exportButton = h("button", { class: "button", title: `The finished chart as a ${shape} image`, onclick: async () => {
     await attempt(() => exportPng(kind, data, ctx, episode.format, settings(), fileName("png")));
   } }, "Export PNG");
@@ -1028,8 +1030,9 @@ function figureCard(kind, data, ctx, episode) {
     paint();
     if (tableHost.firstChild) tableHost.replaceChildren(dataTable(tableFor(kind, data, settings())));
   }) : "";
+  const partRow = kind === "value" ? valuePartPicker(settings, saveSettings, paint) : "";
 
-  const card = h("article", { class: "figure-card" }, holder, characterRow,
+  const card = h("article", { class: "figure-card" }, holder, characterRow, partRow,
     h("div", { class: "figure-foot" },
       playButton, scrubber, durationSelect,
       h("div", { class: "segmented", role: "group", "aria-label": "Chart layout" }, viewButtons),
@@ -1053,6 +1056,20 @@ function figureCard(kind, data, ctx, episode) {
     observer.observe(card);
   }
   return card;
+}
+
+// The value chart's choice of the total or one of the parts it adds up.
+function valuePartPicker(settings, saveSettings, redraw) {
+  const keys = Object.keys(VALUE_PARTS);
+  const buttons = keys.map((key) => h("button", { onclick: () => {
+    saveSettings({ show: key });
+    paintPicker();
+    redraw();
+  } }, VALUE_PARTS[key].label));
+  const paintPicker = () => buttons.forEach((button, i) => button.setAttribute("aria-pressed", String(keys[i] === valuePart(settings()))));
+  paintPicker();
+  return h("div", { class: "figure-options" },
+    h("div", { class: "segmented", role: "group", "aria-label": "Figure to show" }, buttons));
 }
 
 // A breakdown chart's choice of everyone together or chosen characters, each shown with

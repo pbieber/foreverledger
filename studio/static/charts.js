@@ -238,10 +238,14 @@ function header(L, ctx, title, subtitle, icon) {
   return { svg: out, bottom: L.tall ? tagY + tagSize + 10 * s + 28 * s : belowTitle };
 }
 
+// The big figure under the title. With `at` it fades in at that moment; without, it is
+// a counter that stays up and that the animation redraws through `draw`.
 function hero(L, y, money, tone, at) {
   const size = 34 * L.s;
   const fill = tone === "gain" ? C.gain : tone === "loss" ? C.loss : C.text;
-  return { svg: reveal(at, run(L.pad.left, y + size * 0.82, [money], { size, weight: 600, fill, coinScale: HERO_COIN_SCALE, coinOnBaseline: true })), bottom: y + size + 12 * L.s };
+  const draw = (copper) => run(L.pad.left, y + size * 0.82, [{ ...money, copper }], { size, weight: 600, fill, coinScale: HERO_COIN_SCALE, coinOnBaseline: true });
+  const body = draw(money.copper);
+  return { svg: at == null ? `<g data-counter="1">${body}</g>` : reveal(at, body), bottom: y + size + 12 * L.s, draw };
 }
 
 // Splits what is left under the header into the plot and the list beside or below it.
@@ -502,37 +506,67 @@ function auctionFigure(data, ctx, options) {
   return { svg: shell(L, head.svg + big.svg + out), hover, anim, axis };
 }
 
+// What the value chart can draw: the total, or one of the parts it adds up.
+export const VALUE_PARTS = {
+  total: { label: "Total value", color: C.value },
+  gold: { label: "Gold", color: C.value },
+  assets: { label: "Other assets", color: C.crafted },
+  equipped: { label: "Equipped gear", color: C.sold },
+};
+export const valuePart = (settings) => (VALUE_PARTS[settings?.show] ? settings.show : "total");
+
+// A counter that follows the tip of a line: the line's value under each x, averaged
+// over a window around it, so it counts steadily instead of jumping with every point.
+// The window narrows toward both ends, so it starts and finishes on the exact values.
+function steadyCounter(track, x0, width) {
+  const n = 600, reach = Math.round(n * 0.05);
+  const raw = Array.from({ length: n }, (_, i) => pointAt(track, x0 + (width * i) / (n - 1))[1]);
+  const sums = [0];
+  raw.forEach((v, i) => { sums.push(sums[i] + v); });
+  const smooth = raw.map((_, i) => {
+    const h = Math.min(reach, i, n - 1 - i);
+    return (sums[i + h + 1] - sums[i - h]) / (2 * h + 1);
+  });
+  return (x) => {
+    const at = clamp((x - x0) / Math.max(1, width)) * (n - 1);
+    const i = Math.min(n - 2, Math.floor(at));
+    return smooth[i] + (smooth[i + 1] - smooth[i]) * (at - i);
+  };
+}
+
 function valueFigure(data, ctx, options) {
   const L = layoutFor(options), s = L.s;
   const d = data.value;
-  const head = header(L, ctx, CHARTS.value, subtitleFor(ctx, d.start, d.end));
+  const key = valuePart(options.axis), part = VALUE_PARTS[key];
+  const head = header(L, ctx, part.label, subtitleFor(ctx, d.start, d.end));
   const axisBand = 28 * s, axisW = 68 * s;
   if (!d.points.length) {
     const area = { x: L.pad.left, y: head.bottom, w: L.innerW, h: L.H - L.pad.bottom - head.bottom };
     return { svg: shell(L, head.svg + emptyMessage(area, "No valuations recorded in this range", s)), hover: null, anim: null, axis: { start: 0, ignored: false } };
   }
-  const big = hero(L, head.bottom, { copper: d.last }, null, 0.85);
+  const values = d.points.map((p) => p[key]);
+  const last = values[values.length - 1];
+  const big = hero(L, head.bottom, { copper: last }, null, null);
   const top = big.bottom + 8 * s;
   const area = { x: L.pad.left, y: top, w: L.innerW, h: L.H - L.pad.bottom - top - axisBand };
-  const series = [{ key: "total", label: "Total value", color: C.value, area: true }];
-  const totals = d.points.map((p) => p.total);
-  const hi = Math.max(...totals);
-  const axis = resolveAxisStart(options.axis, Math.min(...totals), hi);
+  const series = [{ key, label: part.label, color: part.color, area: true }];
+  const hi = Math.max(...values);
+  const axis = resolveAxisStart(options.axis, Math.min(...values), hi);
   const scale = axisScale(axis.start, hi);
   let out = yAxis(area, scale, s, axisW) + timeAxis(area, d.start, d.end, s, axisW);
   out += windowMark(area, ctx, data, d.start, d.end, s, axisW);
   const chart = lineChart("value", area, series, d.points, d.start, d.end, scale, s, axisW);
   out += chart.svg;
+  // The chosen figure leads the tooltip in its colour; the others follow for context.
   const hover = { kind: "line", s, area: { ...area, x: area.x + axisW, w: area.w - axisW }, points: d.points.map((p) => ({
     x: chart.xOf(p.time), title: formatTime(p.time),
-    rows: [
-      { color: C.value, label: "Total value", copper: p.total, y: chart.yOf(p.total) },
-      { label: "Gold", copper: p.gold },
-      { label: "Other assets", copper: p.assets },
-      { label: "Equipped gear", copper: p.equipped },
-    ],
+    rows: [key, ...Object.keys(VALUE_PARTS).filter((k) => k !== key)].map((k) => (k === key
+      ? { color: part.color, label: part.label, copper: p[k], y: chart.yOf(p[k]) }
+      : { label: VALUE_PARTS[k].label, copper: p[k] })),
   })) };
-  return { svg: shell(L, head.svg + big.svg + out), hover, anim: chart.anim, axis };
+  const track = d.points.map((p) => [chart.xOf(p.time), p[key]]);
+  const counter = { draw: big.draw, last, at: steadyCounter(track, chart.anim.x0, chart.anim.width) };
+  return { svg: shell(L, head.svg + big.svg + out), hover, anim: { ...chart.anim, counter }, axis };
 }
 
 // ---------- Cost and revenue breakdowns ----------
@@ -1151,6 +1185,15 @@ export function createFrames(svg, anim) {
   const rows = anim?.kind === "hbars" ? anim.bars.map((bar, i) => [bar, svg.querySelector(`[data-hbar="${i}"]`)]) : [];
   const clip = anim?.kind === "lines" ? svg.querySelector("[data-clip]") : null;
   const heads = anim?.kind === "lines" ? anim.heads.map((xy, i) => [xy, svg.querySelector(`[data-head="${i}"]`)]) : [];
+  const counter = anim?.counter ? svg.querySelector("[data-counter]") : null;
+  let shown = null;
+  // Redrawn only when the figure it shows changes, which is most frames while counting.
+  const showCount = (copper) => {
+    const rounded = Math.round(copper);
+    if (rounded === shown) return;
+    shown = rounded;
+    replaceSvgContent(counter, anim.counter.draw(rounded));
+  };
   return (progress) => {
     const p = clamp(progress);
     reveals.forEach(([el, at]) => { el.style.opacity = p >= 1 ? 1 : clamp((p - at) / 0.05); });
@@ -1173,8 +1216,16 @@ export function createFrames(svg, anim) {
         el.setAttribute("cy", y);
         el.style.opacity = p > 0 ? 1 : 0;
       });
+      if (counter) showCount(p >= 1 ? anim.counter.last : anim.counter.at(anim.x0 + revealed));
     }
   };
+}
+
+// Swaps an SVG group's drawing. Parsed as SVG so it works on screen and in the
+// standalone document the video is drawn from.
+function replaceSvgContent(el, markup) {
+  const parsed = new DOMParser().parseFromString(`<svg xmlns="http://www.w3.org/2000/svg">${markup}</svg>`, "image/svg+xml");
+  el.replaceChildren(...[...parsed.documentElement.childNodes].map((node) => el.ownerDocument.importNode(node, true)));
 }
 
 // ---------- Hover ----------
