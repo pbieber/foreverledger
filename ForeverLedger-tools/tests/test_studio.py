@@ -918,6 +918,46 @@ class AuctionFigureTests(StudioTestCase):
         e.add("logout", {}, 1500)
         self.assertFalse(self.figure(e)["has_activity"])
 
+    BOOK = {"id": 7, "name": "Cookbook"}
+
+    def test_vendor_stock_counts_only_the_units_listed_at_what_they_cost(self):
+        e = Events()
+        e.activity("vendor_purchase", -900, 1100, item=self.BOOK, quantity=10)
+        e.activity("auction_deposit", -20, 1200, item=self.BOOK, quantity=4)
+        e.activity("loot", 5, 1300)
+        figure = self.figure(e)
+        self.assertEqual((figure["spent"], figure["spent_stock"]), (20, 20 + 4 * 90))
+        # The stock steps up at the listing, just after its deposit.
+        self.assertEqual([(p["time"], p["spent_stock"] - p["spent"]) for p in figure["points"]],
+                         [(1000, 0), (1200, 0), (1200, 360), (2000, 360)])
+        # Spent and net stay cash only.
+        self.assertEqual(figure["net"], -20)
+
+    def test_units_listed_beyond_what_the_vendor_sold_cost_nothing_more(self):
+        e = Events()
+        e.activity("vendor_purchase", -300, 1100, item=self.BOOK, quantity=3)
+        e.activity("vendor_purchase", -500, 1150, item=self.BOOK, quantity=1)
+        e.activity("auction_deposit", -20, 1200, item=self.BOOK, quantity=6)
+        self.assertEqual(self.figure(e)["spent_stock"], 20 + 800)
+
+    def test_a_unit_that_came_back_unsold_is_not_charged_again_when_relisted(self):
+        e = Events()
+        e.activity("vendor_purchase", -400, 1100, item=self.BOOK, quantity=4)
+        e.add("auction_posted", {"key": "P:1", "item": self.BOOK, "quantity": 2}, 1200)
+        e.activity("auction_deposit", -10, 1200, item=self.BOOK, auctionKey="P:1")
+        e.add("auction_outcome", {"auctionKey": "P:1", "item": self.BOOK, "quantity": 2, "outcome": "expired",
+                                  "depositLost": 10}, 1300)
+        e.activity("auction_deposit", -10, 1400, item=self.BOOK, quantity=3)
+        # Two went up, came back, and went up again with one more: three units charged.
+        self.assertEqual(self.figure(e)["spent_stock"], 20 + 300)
+
+    def test_stock_bought_at_the_auction_house_is_already_spent(self):
+        e = Events()
+        e.activity("auction_purchase", -500, 1100, item=self.BOOK, quantity=5)
+        e.activity("auction_deposit", -20, 1200, item=self.BOOK, quantity=5)
+        figure = self.figure(e)
+        self.assertEqual((figure["spent"], figure["spent_stock"]), (520, 520))
+
 
 class CostFigureTests(StudioTestCase):
     WINDOW = {"start": 1000, "end": 2000}

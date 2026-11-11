@@ -437,7 +437,8 @@ function lineChart(id, area, series, points, start, end, scale, s, axisW) {
       lines += `<defs><linearGradient id="${fillId}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${sr.color}" stop-opacity=".30"/><stop offset="1" stop-color="${sr.color}" stop-opacity=".02"/></linearGradient></defs>`;
       lines += `<path d="M${xy[0][0].toFixed(1)} ${yOf(scale.start)}L${path}L${xy[xy.length - 1][0].toFixed(1)} ${yOf(scale.start)}Z" fill="url(#${fillId})"/>`;
     }
-    lines += `<path d="M${path}" fill="none" stroke="${sr.color}" stroke-width="${2 * s}" stroke-linejoin="round" stroke-linecap="round"/>`;
+    const dash = sr.dashed ? ` stroke-dasharray="${6 * s} ${5 * s}"` : "";
+    lines += `<path d="M${path}" fill="none" stroke="${sr.color}" stroke-width="${2 * s}" stroke-linejoin="round" stroke-linecap="round"${dash}/>`;
     const [lastX, lastY] = xy[xy.length - 1];
     dots += `<circle data-head="${index}" cx="${lastX}" cy="${lastY}" r="${4 * s}" fill="${sr.color}" stroke="${C.surface}" stroke-width="${2 * s}"/>`;
     heads.push(xy);
@@ -457,16 +458,24 @@ function windowMark(area, ctx, data, start, end, s, axisW) {
     size, fill: C.text2, anchor: roomOnRight ? "start" : "end" });
 }
 
-function legend(items, x, y, s) {
-  let out = "", cursor = x;
-  const size = 13 * s;
+// Wraps to another row when the next item would pass `right`, and says how many rows it took.
+function legend(items, x, y, s, right = Infinity) {
+  let out = "", cursor = x, rows = 1;
+  const size = 13 * s, rowH = 22 * s;
   items.forEach((item) => {
-    out += `<line x1="${cursor}" y1="${y - size * 0.32}" x2="${cursor + 16 * s}" y2="${y - size * 0.32}" stroke="${item.color}" stroke-width="${2 * s}" stroke-linecap="round"/>`;
     const segments = [`${item.label}  `, { copper: item.copper }];
+    const width = 22 * s + runWidth(segments, size, 400);
+    if (cursor > x && cursor + width > right) {
+      cursor = x;
+      y += rowH;
+      rows += 1;
+    }
+    const dash = item.dashed ? ` stroke-dasharray="${4 * s} ${4 * s}"` : "";
+    out += `<line x1="${cursor}" y1="${y - size * 0.32}" x2="${cursor + 16 * s}" y2="${y - size * 0.32}" stroke="${item.color}" stroke-width="${2 * s}" stroke-linecap="${item.dashed ? "butt" : "round"}"${dash}/>`;
     out += run(cursor + 22 * s, y, segments, { size, fill: C.text2 });
-    cursor += 22 * s + runWidth(segments, size, 400) + 18 * s;
+    cursor += width + 18 * s;
   });
-  return out;
+  return { svg: out, height: (rows - 1) * rowH };
 }
 
 function auctionFigure(data, ctx, options) {
@@ -476,16 +485,22 @@ function auctionFigure(data, ctx, options) {
   const tone = d.net > 0 ? "gain" : d.net < 0 ? "loss" : null;
   const big = hero(L, head.bottom, { copper: d.net, signed: true }, tone, 0.85);
   const { plot, side } = regions(L, big.bottom + 6 * s);
-  const legendBand = 26 * s, axisBand = 28 * s, axisW = 68 * s;
+  const axisBand = 28 * s, axisW = 68 * s;
+  // The dashed line adds vendor-bought stock at what it cost when it went up for auction.
+  const withStock = d.spent_stock > d.spent;
+  const series = [{ key: "sold", label: "Sold", color: C.sold }, { key: "spent", label: "Spent", color: C.spent },
+    ...(withStock ? [{ key: "spent_stock", label: "With vendor stock", color: C.spent, dashed: true }] : [])];
+  const totals = { sold: d.sold, spent: d.spent, spent_stock: d.spent_stock };
+  const key = legend(series.map((sr) => ({ label: sr.label, copper: totals[sr.key], color: sr.color, dashed: sr.dashed })),
+    plot.x + axisW, plot.y + 13 * s, s, plot.x + plot.w);
+  const legendBand = 26 * s + key.height;
   const area = { x: plot.x, y: plot.y + legendBand, w: plot.w, h: plot.h - legendBand - axisBand };
-  const series = [{ key: "sold", label: "Sold", color: C.sold }, { key: "spent", label: "Spent", color: C.spent }];
-  const totals = { sold: d.sold, spent: d.spent };
-  let out = legend(series.map((sr) => ({ label: sr.label, copper: totals[sr.key], color: sr.color })), plot.x + axisW, plot.y + 13 * s, s);
+  let out = key.svg;
   let hover = null, anim = null, axis = { start: 0, ignored: false };
   if (!d.has_activity) {
     out += yAxis(area, axisScale(0, COPPER_PER_GOLD), s, axisW) + emptyMessage({ ...area, x: area.x + axisW, w: area.w - axisW }, "No auction house activity in this range", s);
   } else {
-    const values = d.points.flatMap((p) => [p.sold, p.spent]);
+    const values = d.points.flatMap((p) => series.map((sr) => p[sr.key]));
     const hi = Math.max(...values);
     axis = resolveAxisStart(options.axis, Math.min(...values), hi);
     const scale = axisScale(axis.start, hi);

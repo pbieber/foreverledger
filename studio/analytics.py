@@ -251,24 +251,96 @@ def _span(db, window, chart_range):
     return window["start"], window["end"]
 
 
+def _vendor_stock_listed(db, activities):
+    """What vendor-bought units cost when they went up for auction: [(time, copper)].
+
+    Each item keeps its vendor-bought units first in, first out. A listing takes them at
+    what they cost, as many as it holds and as are left, so units bought but never listed
+    cost nothing here, and units listed beyond the vendor's, as farmed ones, cost nothing
+    either. A unit that came back unsold is not charged again when it goes back up: a
+    return gives credit for up to the units charged and still out, and a later listing
+    uses that credit first. Purchases and listings with no quantity can't be split into
+    units, so they are left out.
+    """
+    names, steps = {}, defaultdict(list)  # name -> [(time, order, kind, units, copper)]
+
+    def name_of(item):
+        return item.get("name") or names.get(_item_id(item.get("id")))
+
+    posted = _postings(db)
+    for moment, d, _ in activities:
+        category, item = d.get("category"), d.get("item") or {}
+        if item.get("name") and _item_id(item.get("id")):
+            names[_item_id(item.get("id"))] = item["name"]
+        if category == "vendor_purchase" and item.get("name") and (d.get("quantity") or 0) > 0:
+            steps[item["name"]].append((moment, 0, "bought", d["quantity"], -(d.get("amount") or 0)))
+        elif category == "auction_deposit" and item.get("name"):
+            units = d.get("quantity") or posted.get(d.get("auctionKey"), {}).get("quantity") or 0
+            if units > 0:
+                steps[item["name"]].append((moment, 2, "listed", units, 0))
+    for moment, item_id, name, quantity, cost in _unrecorded_vendor_buys(db):
+        steps[name].append((moment, 0, "bought", quantity, cost))
+    for moment, _, item, units in _returned_listings(db, activities):
+        name = name_of(item)
+        if name in steps and units:
+            steps[name].append((moment, 1, "returned", units, 0))
+    charges = []
+    for rows in steps.values():
+        if not any(kind == "bought" for _, _, kind, _, _ in rows):
+            continue
+        pool, out, credit = deque(), 0, 0  # Units bought and not yet listed; units charged and still out.
+        for moment, _, kind, units, copper in sorted(rows, key=lambda row: row[:2]):
+            if kind == "bought":
+                pool.append([units, copper / units])
+            elif kind == "returned":
+                back = min(units, out)
+                out, credit = out - back, credit + back
+            else:
+                again = min(credit, units)
+                credit, out, units = credit - again, out + again, units - again
+                cost = 0.0
+                while units and pool:
+                    take = min(units, pool[0][0])
+                    cost += take * pool[0][1]
+                    pool[0][0] -= take
+                    units, out = units - take, out + take
+                    if not pool[0][0]:
+                        pool.popleft()
+                if round(cost):
+                    charges.append((moment, round(cost)))
+    return charges
+
+
 def auction_figure(db, window, chart_range):
     """Cumulative gold collected and spent at the auction house, and the best items.
 
     Sold is gold collected, net of commission, and includes returned deposits. Spent
     is purchases plus deposits and cancellation fees. Sales count when their mail is
-    collected. Net gain is cash only: stock still held is not counted.
+    collected. Net gain is cash only: stock still held is not counted. Spent with
+    vendor stock adds what vendor-bought units cost when they were listed (see
+    `_vendor_stock_listed`), counted at the listing.
     """
     start, end = _span(db, window, chart_range)
-    sold, spent, points, items = 0, 0, [{"time": start, "sold": 0, "spent": 0}], {}
-    for moment, d, _ in _activities(db):
+    sold, spent, stock, items = 0, 0, 0, {}
+    points = [{"time": start, "sold": 0, "spent": 0, "spent_stock": 0}]
+    activities = _activities(db)
+    changes = [(moment, d) for moment, d, _ in activities]
+    changes += [(moment, {"category": "vendor_stock", "amount": -copper})
+                for moment, copper in _vendor_stock_listed(db, activities)]
+    changes.sort(key=lambda change: change[0])
+    for moment, d in changes:
         category, amount = d.get("category"), d.get("amount") or 0
-        if not start <= moment <= end or not amount or category not in AH_SOLD | AH_SPENT:
+        if not start <= moment <= end or not amount or category not in AH_SOLD | AH_SPENT | {"vendor_stock"}:
             continue
         if category in AH_SOLD:
             sold += amount
-        else:
+        elif category in AH_SPENT:
             spent -= amount
-        points.append({"time": moment, "sold": sold, "spent": spent})
+        else:
+            stock -= amount
+        points.append({"time": moment, "sold": sold, "spent": spent, "spent_stock": spent + stock})
+        if category == "vendor_stock":
+            continue
         name = (d.get("item") or {}).get("name") or UNKNOWN_ITEM
         row = items.setdefault(name, {"name": name, "item_id": None, "net": 0, "sold": 0, "spent": 0, "quantity": 0})
         row["item_id"] = row["item_id"] or (d.get("item") or {}).get("id") or None
@@ -278,10 +350,11 @@ def auction_figure(db, window, chart_range):
             row["quantity"] += d.get("quantity") or 0
         else:
             row["spent"] -= amount
-    points.append({"time": end, "sold": sold, "spent": spent})
+    points.append({"time": end, "sold": sold, "spent": spent, "spent_stock": spent + stock})
     named = [row for name, row in items.items() if name != UNKNOWN_ITEM]
     top = sorted(named, key=lambda row: (-row["net"], row["name"]))[:5]
-    return {"start": start, "end": end, "sold": sold, "spent": spent, "net": sold - spent,
+    return {"start": start, "end": end, "sold": sold, "spent": spent, "spent_stock": spent + stock,
+            "net": sold - spent,
             "points": _thin(points, start, end), "top": top, "items": len(named),
             "has_activity": bool(items)}
 
