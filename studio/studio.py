@@ -61,6 +61,10 @@ class Studio:
         self.plan_path = self.data_dir / "studio.sqlite"
         self.wow_roots = [Path(p) for p in (wow_roots if wow_roots is not None else DEFAULT_WOW_ROOTS)]
         self.import_lock = threading.Lock()
+        # What was worked out from each ledger as it now is, so only the first request
+        # after an import reads it all: {source: (file stamp, analytics memo)}.
+        self.figure_locks = {source: threading.Lock() for source in SOURCE_LABELS}
+        self.memos, self.warmed = {}, {}
         self.status = {}
         self.seen_path = self.data_dir / "imported-files.json"
         self.seen = self._load_seen()
@@ -97,6 +101,51 @@ class Studio:
             return None
         db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=30)
         return _Closing(db)
+
+    def _stamp(self, source):
+        try:
+            found = self.ledger_path(source).stat()
+        except OSError:
+            return None
+        return found.st_mtime_ns, found.st_size
+
+    def read_figures(self, source):
+        """A read-only connection for working out figures, or None before anything was imported.
+
+        It carries what earlier requests worked out from the ledger as it now is, and
+        holds the source's lock until it closes, as that work is shared.
+        """
+        lock = self.figure_locks[source]
+        lock.acquire()
+        try:
+            stamp = self._stamp(source)
+            if stamp is None:
+                lock.release()
+                return None
+            if self.memos.get(source, (None, None))[0] != stamp:
+                self.memos[source] = (stamp, {})
+            db = sqlite3.connect(self.ledger_path(source).as_uri() + "?mode=ro", uri=True, timeout=30,
+                                 factory=analytics.Reader)
+            db.memo = self.memos[source][1]
+        except BaseException:
+            lock.release()
+            raise
+        return _Closing(db, lock)
+
+    def warm(self):
+        """Work out what the figures need from each ledger that changed, ahead of the
+        first request. The lock is let go between steps, so a request waits for one at most."""
+        for source in SOURCE_LABELS:
+            stamp = self._stamp(source)
+            if stamp is None or self.warmed.get(source) == stamp:
+                continue
+            for step in analytics.WARMERS:
+                reader = self.read_figures(source)
+                if not reader:
+                    break
+                with reader as db:
+                    step(db)
+            self.warmed[source] = stamp
 
     def detect_files(self):
         """Register each client's SavedVariables, unless the user removed that file."""
@@ -181,7 +230,7 @@ class Studio:
                     self.import_path(source, path)
 
     def regenerate_mock(self):
-        with self.import_lock:
+        with self.import_lock, self.figure_locks["mock"]:
             path = self.ledger_path("mock")
             if path.exists():
                 path.unlink()
@@ -210,14 +259,16 @@ class Studio:
 class _Closing:
     """`with` closes the connection, which sqlite3's own context manager does not do."""
 
-    def __init__(self, db):
-        self.db = db
+    def __init__(self, db, lock=None):
+        self.db, self.lock = db, lock
 
     def __enter__(self):
         return self.db
 
     def __exit__(self, *_):
         self.db.close()
+        if self.lock:
+            self.lock.release()
 
 
 def _source(value):
@@ -358,7 +409,7 @@ def post_source_import(app, body, query, source):
 
 @route("GET", r"/api/data/(\w+)/windows")
 def get_windows(app, body, query, source):
-    reader = app.read_ledger(_source(source))
+    reader = app.read_figures(_source(source))
     if not reader:
         return {"windows": []}
     with reader as db:
@@ -367,7 +418,7 @@ def get_windows(app, body, query, source):
 
 @route("GET", r"/api/data/(\w+)/figures")
 def get_figures(app, body, query, source):
-    reader = app.read_ledger(_source(source))
+    reader = app.read_figures(_source(source))
     if not reader:
         return {"empty": True}
     window = query.get("window", ["all"])[0]
@@ -386,7 +437,7 @@ def get_figures(app, body, query, source):
 @route("GET", r"/api/data/(\w+)/item")
 def get_item(app, body, query, source):
     """One item's analysis, and the items with activity in the window to choose from."""
-    reader = app.read_ledger(_source(source))
+    reader = app.read_figures(_source(source))
     if not reader:
         return {"empty": True}
     window_id = query.get("window", ["all"])[0]
@@ -410,7 +461,7 @@ def get_compare(app, body, query, source):
     """Items side by side, and the items with activity in the window to choose from.
     Each `name` is one item. Without `chosen`, nothing has been picked yet and the best
     sellers are compared."""
-    reader = app.read_ledger(_source(source))
+    reader = app.read_figures(_source(source))
     if not reader:
         return {"empty": True}
     window_id = query.get("window", ["all"])[0]
@@ -433,7 +484,7 @@ def get_compare(app, body, query, source):
 def get_periods(app, body, query, source):
     """One item in two windows side by side. The two `period` windows are those chosen;
     without both, the episode's `window` and the one before it are compared."""
-    reader = app.read_ledger(_source(source))
+    reader = app.read_figures(_source(source))
     if not reader:
         return {"empty": True}
     window_id = query.get("window", ["all"])[0]
@@ -470,7 +521,7 @@ def get_visual_search(app, body, query, source):
     """Items to show: this source's own items first, then anything Wowhead knows by those words."""
     words = query.get("q", [""])[0][:100]
     found = []
-    reader = app.read_ledger(_source(source))
+    reader = app.read_figures(_source(source))
     if reader:
         with reader as db:
             found = [dict(item, in_ledger=True) for item in analytics.item_catalog(db, words)]
@@ -484,7 +535,7 @@ def get_visual_search(app, body, query, source):
 @route("GET", r"/api/visual/(\w+)/top")
 def get_visual_top(app, body, query, source):
     """The items with the most sales, profit and loss in the window, with their icons."""
-    reader = app.read_ledger(_source(source))
+    reader = app.read_figures(_source(source))
     if not reader:
         return {"empty": True}
     window_id = query.get("window", ["all"])[0]
@@ -598,6 +649,7 @@ def watch(app, interval=5):
     while True:
         try:
             app.import_changed()
+            app.warm()
         except Exception as err:  # A background import must never stop the website.
             print(f"Import check failed: {err}", file=sys.stderr)
         time.sleep(interval)

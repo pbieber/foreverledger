@@ -1,4 +1,4 @@
-import { attachHover, breakdownGroups, CHARTS, createFrames, exportPng, formatTime, moneyNode, moneyWords, renderForScreen, renderVideo, saveBlob, tableFor, VALUE_PARTS, valuePart, VIDEO_HOLD_SECONDS, VideoCancelled } from "./charts.js";
+import { attachHover, breakdownGroups, CHARTS, COMPARE_LAYOUTS, compareLayout,createFrames, exportPng, formatTime, moneyNode, moneyWords, renderForScreen, renderVideo, saveBlob, tableFor, VALUE_PARTS, valuePart, VIDEO_HOLD_SECONDS, VideoCancelled } from "./charts.js";
 import { COINS } from "./coins.js";
 import { drawVisual, QUALITY_COLORS, shownLines, valueWords, visualBlob } from "./visuals.js";
 
@@ -1093,8 +1093,10 @@ function figureCard(kind, data, ctx, episode) {
     if (tableHost.firstChild) tableHost.replaceChildren(dataTable(tableFor(kind, data, settings())));
   }) : "";
   const partRow = kind === "value" ? valuePartPicker(settings, saveSettings, paint) : "";
+  // Choosing how a Short lays the comparison out shows the vertical chart, where it applies.
+  const layoutRow = kind === "compare" || kind === "periods" ? compareLayoutPicker(settings, saveSettings, () => viewButtons[1].click()) : "";
 
-  const card = h("article", { class: "figure-card" }, holder, characterRow, partRow,
+  const card = h("article", { class: "figure-card" }, holder, characterRow, partRow, layoutRow,
     h("div", { class: "figure-foot" },
       playButton, scrubber, durationSelect,
       h("div", { class: "segmented", role: "group", "aria-label": "Chart layout" }, viewButtons),
@@ -1118,6 +1120,22 @@ function figureCard(kind, data, ctx, episode) {
     observer.observe(card);
   }
   return card;
+}
+
+// How a vertical comparison is laid out: a card per item with every figure, or a line
+// per item with the four figures that fit across.
+function compareLayoutPicker(settings, saveSettings, redraw) {
+  const keys = Object.keys(COMPARE_LAYOUTS);
+  const buttons = keys.map((key) => h("button", { onclick: () => {
+    saveSettings({ layout: key });
+    paintPicker();
+    redraw();
+  } }, COMPARE_LAYOUTS[key]));
+  const paintPicker = () => buttons.forEach((button, i) => button.setAttribute("aria-pressed", String(keys[i] === compareLayout(settings()))));
+  paintPicker();
+  return h("div", { class: "figure-options" }, h("span", { class: "foot-label" }, "Vertical layout"),
+    h("div", { class: "segmented", role: "group", "aria-label": "Vertical layout",
+      title: "Rows show net profit, profit on sold, sold and margin each, a line per item" }, buttons));
 }
 
 // The value chart's choice of the total or one of the parts it adds up.

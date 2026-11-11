@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 from http.server import ThreadingHTTPServer
@@ -176,6 +177,12 @@ class ChartSettingsTests(StudioTestCase):
                 store.update_episode(self.db, self.episode, {"chart_settings": bad})
 
     def test_the_value_chart_keeps_which_part_it_shows(self):
+        layouts = {"compare": {"layout": "rows"}, "periods": {"layout": "cards"}}
+        store.update_episode(self.db, self.episode, {"chart_settings": layouts})
+        saved = store.get_episode(self.db, self.episode)["chart_settings"]
+        self.assertEqual((saved["compare"]["layout"], saved["periods"]["layout"]), ("rows", "cards"))
+        with self.assertRaises(store.Invalid):
+            store.update_episode(self.db, self.episode, {"chart_settings": {"compare": {"layout": "grid"}}})
         store.update_episode(self.db, self.episode, {"chart_settings": {"value": {"show": "gold"}}})
         saved = store.get_episode(self.db, self.episode)["chart_settings"]
         self.assertEqual(saved["value"], {"mode": "zero", "gold": 0, "seconds": 3, "show": "gold"})
@@ -1857,6 +1864,27 @@ class ServerTests(StudioTestCase):
         self.assertEqual([w["id"] for w in default["windows"]], [first, second])
         self.assertEqual(default["name"], default["choices"][0]["name"])
         self.assertEqual(self.api("GET", "/api/data/tbc/periods"), {"empty": True})
+
+    def test_a_ledger_is_read_once_until_it_changes(self):
+        built = []
+        original = analytics.ItemLedger.__init__
+
+        def counting(ledger_self, db):
+            built.append(1)
+            original(ledger_self, db)
+
+        with mock.patch.object(analytics.ItemLedger, "__init__", counting):
+            first = self.api("GET", "/api/data/mock/item?window=all")
+            again = self.api("GET", "/api/data/mock/item?window=all")
+            self.api("GET", "/api/data/mock/compare?window=all")
+            self.api("GET", "/api/visual/mock/top?window=all")
+            self.assertEqual(len(built), 1)
+            self.assertEqual(first, again)
+            self.app.warm()
+            self.assertEqual(len(built), 1)
+            self.api("POST", "/api/sources/mock/import", {})
+            self.assertEqual(self.api("GET", "/api/data/mock/item?window=all"), first)
+            self.assertEqual(len(built), 2)
 
     def test_sources_stay_separate(self):
         mock = self.api("GET", "/api/data/mock/figures?window=all&range=to_date")

@@ -14,6 +14,7 @@ SOURCES = ("forever", "tbc", "mock")
 CHARTS = ("", "start", "auction", "value", "costs", "revenue", "item", "compare", "periods")
 ITEM_VIEWS = ("one", "compare", "periods")
 VALUE_PARTS = ("total", "gold", "assets", "equipped")
+COMPARE_LAYOUTS = ("cards", "rows")
 MAX_COMPARED = 6
 RANGES = ("window", "to_date")
 AXIS_MODES = ("zero", "fit", "custom")
@@ -83,7 +84,8 @@ def _chart_settings(value):
     """Per chart: where its vertical axis starts, how long its animation runs, for the
     value chart whether it shows the total or one part, for the
     item chart which item it shows and whether it compares items or periods instead, for
-    the comparison which items, in order, and for the periods which item and windows."""
+    the comparison which items, in order, for the periods which item and windows, and for
+    both how a vertical one is laid out."""
     if not isinstance(value, dict) or not set(value) <= set(CHARTS) - {""}:
         raise Invalid("Chart settings are not valid")
     clean = {}
@@ -119,6 +121,9 @@ def _chart_settings(value):
         if chart == "item" and "view" in settings:
             # The item section shows one item, or several side by side.
             entry["view"] = _choice(settings["view"], ITEM_VIEWS, "Item view")
+        if chart in ("compare", "periods") and "layout" in settings:
+            # How a vertical comparison is laid out: a card per item, or a line per item.
+            entry["layout"] = _choice(settings["layout"], COMPARE_LAYOUTS, "Vertical layout")
         if chart == "compare" and "names" in settings:
             names = settings["names"]
             if (not isinstance(names, list) or len(names) > MAX_COMPARED

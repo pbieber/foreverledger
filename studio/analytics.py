@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import bisect
 import datetime
+import functools
 import json
 import re
+import sqlite3
 from collections import Counter, defaultdict, deque
 
 import ledger
@@ -66,6 +68,28 @@ class UnknownWindow(Exception):
     pass
 
 
+class Reader(sqlite3.Connection):
+    """A connection that can carry `memo`: a dict of what was already worked out from
+    its database. Reading a whole ledger takes seconds, so whoever opens the connection
+    hands every one the same dict until the database changes, then a new one, and lets
+    one thread at a time use it."""
+    memo = None
+
+
+def _once(function):
+    """Work a whole-ledger answer out once per `Reader.memo`. The answer is shared, so
+    callers must not change it. A plain connection works it out every time."""
+    @functools.wraps(function)
+    def remembered(db):
+        memo = getattr(db, "memo", None)
+        if memo is None:
+            return function(db)
+        if function.__name__ not in memo:
+            memo[function.__name__] = function(db)
+        return memo[function.__name__]
+    return remembered
+
+
 def _midnight_before(timestamp):
     local = datetime.datetime.fromtimestamp(timestamp)
     return timestamp - (local.hour * 3600 + local.minute * 60 + local.second)
@@ -111,6 +135,7 @@ def marker_intervals(db):
     return intervals
 
 
+@_once
 def windows(db):
     """Time spans an episode can use: markers first, then calendar days, then everything."""
     span = db.execute("SELECT MIN(time),MAX(time) FROM events").fetchone()
@@ -139,6 +164,7 @@ def resolve_window(db, window_id):
     raise UnknownWindow(window_id)
 
 
+@_once
 def _balances(db):
     """Per character, time-ordered (time, balance), with the opening balance kept separately."""
     corrected = {json.loads(row[0]).get("balanceID") for row in db.execute(
@@ -179,10 +205,12 @@ def gold_between(db, start, end):
     return total_start, total_end, characters
 
 
+@_once
 def _owners(db):
     return ledger.owned_keys(db)
 
 
+@_once
 def _activities(db):
     """Activities that still stand, as (time, data, character), in time order."""
     rows = [(event_id, moment, json.loads(data), character) for event_id, moment, data, character in db.execute(
@@ -397,6 +425,7 @@ def value_figure(db, window, chart_range):
             "unpriced": last["unpriced"] if last else 0, "accounts": len(latest)}
 
 
+@_once
 def _item_names(db):
     """Every item name the ledger has seen, from item records anywhere in the events."""
     names = set()
@@ -558,6 +587,7 @@ def _lost_listing_fees(db, activities):
     return losses
 
 
+@_once
 def _postings(db):
     """Each auction posted, by its key, with what was listed. An outcome may leave that
     out, and a later posting record can be a bare status change, so those are skipped."""
@@ -757,7 +787,7 @@ class _Tally:
         rows = [{"key": key, "label": label, "value": totals[key], "count": self.counts[key],
                  "by_character": {c: v[key] for c, v in amounts.items() if v[key]}} for key, label in self.row_defs]
         rows.sort(key=lambda row: (-row["value"], order[row["key"]]))
-        known = _characters(db)
+        known = dict(_characters(db))
         for character in amounts:
             known.setdefault(character, {"id": character, "name": character, "slot": len(known)})
         characters = [dict(known[c], total=sum(amounts[c].values()))
@@ -767,6 +797,7 @@ class _Tally:
                 "parts_by_character": self.pieces, "characters": characters, "has_activity": any(totals.values())}
 
 
+@_once
 def _characters(db):
     """Every character with a fixed place in line, so it keeps one colour whatever the
     window or selection: the order each first did anything with money."""
@@ -787,6 +818,7 @@ def _item_id(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
+@_once
 def _names_by_id(db):
     """Item names by ID, from item records and chat links anywhere outside snapshots.
 
@@ -823,6 +855,7 @@ def item_catalog(db, words="", limit=30):
     return [{"item_id": item_id, "name": name} for _, _, item_id, name in found[:limit]]
 
 
+@_once
 def _unrecorded_vendor_buys(db):
     """Vendor buys recorded only as gold leaving at a merchant: (time, item ID, name, quantity, copper).
 
@@ -839,6 +872,8 @@ def _unrecorded_vendor_buys(db):
         d = json.loads(data)
         if (d.get("delta") or 0) < 0 and (d.get("context") or {}).get("merchant"):
             spends.setdefault((source, character), []).append((moment, event_id))
+    for found in spends.values():
+        found.sort()
     owner = {}  # balance ID -> index of the unresolved reconciliation it belongs to
     unresolved = []
     for source, character, data in db.execute(
@@ -856,9 +891,13 @@ def _unrecorded_vendor_buys(db):
             "SELECT source_id,character,time,data FROM events WHERE kind='loot_message' ORDER BY time,source_id,sequence"):
         text = json.loads(data).get("text") or ""
         match = ITEM_LINK.search(text) if text.startswith(RECEIVED_PREFIX) else None
-        near = [(abs(moment - t), t > moment, t, i) for t, i in spends.get((source, character), [])
-                if abs(moment - t) <= MERCHANT_LINE_SECONDS]
-        if not match or not near:
+        if not match:
+            continue
+        found = spends.get((source, character), [])
+        first = bisect.bisect_left(found, (moment - MERCHANT_LINE_SECONDS,))
+        last = bisect.bisect_left(found, (moment + MERCHANT_LINE_SECONDS + 1,))
+        near = [(abs(moment - t), t > moment, t, i) for t, i in found[first:last]]
+        if not near:
             continue
         _, _, spent_at, balance = min(near)  # The nearest, and on a tie the spend before the line.
         if balance in owner:
@@ -870,6 +909,16 @@ def _unrecorded_vendor_buys(db):
             if buy["lines"] and len({i for i, _, _ in buy["lines"]}) == 1 and buy["lines"][0][1]]
 
 
+@_once
+def _stock_snapshots(db):
+    """Where every snapshot of a place that keeps items sits, without its rows:
+    [(character, place, time, source, sequence, ID)]. Snapshots are most of a ledger, so
+    they are gone through once here and afterwards only the few needed are read."""
+    return db.execute(
+        "SELECT character, json_extract(data,'$.location') AS place, time, source_id, sequence, id FROM events "
+        f"WHERE kind='snapshot' AND place IN ({','.join('?' * len(STOCK_PLACES))})", STOCK_PLACES).fetchall()
+
+
 def _stock_at(db, end):
     """Units held at a moment, from each character's latest snapshot of every place that
     keeps items: a list of (item as found in the row, place, units).
@@ -878,16 +927,15 @@ def _stock_at(db, end):
     sold is waiting for its money, so its item is gone. Returns None when no character
     had any of these places on record by then.
     """
-    rows = db.execute(
-        "SELECT data FROM (SELECT data, ROW_NUMBER() OVER (PARTITION BY character, json_extract(data,'$.location') "
-        "ORDER BY time DESC, source_id DESC, sequence DESC) AS latest FROM events WHERE kind='snapshot' AND time<=? "
-        f"AND json_extract(data,'$.location') IN ({','.join('?' * len(STOCK_PLACES))})) WHERE latest=1",
-        (end, *STOCK_PLACES)).fetchall()
-    if not rows:
+    latest = {}  # (character, place) -> (time, source, sequence, ID) of its last snapshot by then
+    for character, place, *found in _stock_snapshots(db):
+        if found[0] <= end and tuple(found) > latest.get((character, place), ()):
+            latest[(character, place)] = tuple(found)
+    if not latest:
         return None
     held = []
-    for data, in rows:
-        d = json.loads(data)
+    for *_, event_id in latest.values():
+        d = json.loads(db.execute("SELECT data FROM events WHERE id=?", (event_id,)).fetchone()[0])
         place = d.get("location")
         for row in d.get("rows") or []:
             if place == "auctions" and row.get("status") not in (None, 0):
@@ -976,6 +1024,12 @@ class ItemLedger:
                     "time": moment, "quantity": int(match.group(3) or 1),
                     "source": source, "character": character, "sequence": sequence})
 
+    def warm(self):
+        """Work out every recipe now, so the first analysis doesn't wait for them."""
+        for name, record in self.records.items():
+            if record["crafted"]:
+                self.recipe(name)
+
     def _name(self, item):
         name = item.get("name")
         if isinstance(name, str) and name:
@@ -998,9 +1052,9 @@ class ItemLedger:
         if self._bag_index is None:
             # Where every bag snapshot sits in its log, read once: {(source, character): ([sequence], [id])}.
             self._bag_index = defaultdict(lambda: ([], []))
-            for event_id, source, character, sequence in self.db.execute(
-                    "SELECT id,source_id,character,sequence FROM events WHERE kind='snapshot' "
-                    "AND json_extract(data,'$.location')='bags' ORDER BY source_id,sequence"):
+            bags = sorted((source, sequence, character, event_id) for character, place, _, source, sequence, event_id
+                          in _stock_snapshots(self.db) if place == "bags")
+            for source, sequence, character, event_id in bags:
                 sequences, ids = self._bag_index[(source, character)]
                 sequences.append(sequence)
                 ids.append(event_id)
@@ -1271,13 +1325,30 @@ class ItemLedger:
         return crafted and self._materials_each(name, end, frozenset({name})) is None
 
 
+def item_ledger(db):
+    """The item ledger of this database, built once per `Reader.memo`."""
+    memo = getattr(db, "memo", None)
+    if memo is None:
+        return ItemLedger(db)
+    if "item_ledger" not in memo:
+        memo["item_ledger"] = ItemLedger(db)
+    items = memo["item_ledger"]
+    items.db = db  # The connection it was built on is closed by now.
+    return items
+
+
+# What every figure needs from the whole ledger, slowest last, each called with a `Reader`
+# to have it ready ahead of the first request.
+WARMERS = (windows, _characters, _stock_snapshots, lambda db: item_ledger(db).warm(), _item_names)
+
+
 def item_figure(db, window, name=None):
     """One item's analysis inside a window, and the items worth choosing from.
 
     Items are offered by what they sold for, then by how many moved. With no name, the
     first of them is analysed.
     """
-    items = ItemLedger(db)
+    items = item_ledger(db)
     start, end = window["start"], window["end"]
     choices = _item_choices(items, start, end)
     name = name or (choices[0]["name"] if choices else None)
@@ -1295,7 +1366,7 @@ def compare_figure(db, window, names=None):
     """Several items side by side inside a window, in the order given, and the items
     worth choosing from. With names None, none chosen yet, the best three sellers are
     compared. Blank names are left out, so [""] compares nothing."""
-    items = ItemLedger(db)
+    items = item_ledger(db)
     start, end = window["start"], window["end"]
     choices = _item_choices(items, start, end)
     if names is None:
@@ -1327,7 +1398,7 @@ def default_periods(db, window_id):
 def periods_figure(db, periods, name=None):
     """One item in two windows side by side, earliest first, and the items worth choosing
     from, which are those with activity in either. With no name, the first of them."""
-    items = ItemLedger(db)
+    items = item_ledger(db)
     periods = sorted(periods, key=lambda w: (w["start"], w["end"]))
     choices = _item_choices(items, min(w["start"] for w in periods), max(w["end"] for w in periods))
     name = name or (choices[0]["name"] if choices else None)
@@ -1346,7 +1417,7 @@ def top_items(db, window, limit=TOP_ITEMS):
     row has all three, and appears in every list it makes. Items with no known ID are left
     out, as a card can't show them.
     """
-    items = ItemLedger(db)
+    items = item_ledger(db)
     start, end = window["start"], window["end"]
     rows = []
     for choice in _item_choices(items, start, end):

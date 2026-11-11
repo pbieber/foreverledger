@@ -860,6 +860,11 @@ const COMPARE_COLUMNS = [
   { key: "sales_rate", label: "Sales rate", short: "Sales rate", percent: true, best: "high", meter: true },
 ];
 
+// The figures a Short has room for when it shows a line per item, as the wide chart does.
+const COMPARE_ROW_KEYS = ["net", "profit_sold", "sold", "margin"];
+export const COMPARE_LAYOUTS = { cards: "Cards", rows: "Rows" };
+export const compareLayout = (settings) => (settings?.layout in COMPARE_LAYOUTS ? settings.layout : "cards");
+
 // Why a margin percentage is missing, in a few words.
 export function marginShareNote(row) {
   if (row.margin_share != null) return "";
@@ -911,8 +916,9 @@ function compareTip(row) {
 
 // One line per item, each figure in its column, and a meter for the sales rate. The
 // best of each column where better is plain sits on a highlight. A Short stacks a
-// card per item instead, as a table would be too narrow to read. With `periods`, the
-// lines are one item in different windows, each named by its window.
+// card per item instead, as the whole table would be too narrow to read, or with the
+// rows layout chosen keeps the lines and shows only the four figures that fit. With
+// `periods`, the lines are one item in different windows, each named by its window.
 function compareFigure(data, ctx, options, periods = false) {
   const L = layoutFor(options), s = L.s;
   const rows = data.items ?? [];
@@ -991,25 +997,45 @@ function compareFigure(data, ctx, options, periods = false) {
   const hit = (row, y, h) => ({ x: area.x, y, w: area.w, h, title: labelOf(row), text: `net ${moneyWords(row.net, { signed: true })}`, rows: compareTip(row) });
 
   let out = "";
-  if (!L.tall) {
-    const labelSize = 12 * s, nameW = area.w * 0.2;
-    const colW = (area.w - nameW) / COMPARE_COLUMNS.length;
-    const right = (k) => area.x + nameW + colW * (k + 1) - 4 * s;
-    const headH = labelSize + 14 * s;
+  const asRows = L.tall && compareLayout(options.axis) === "rows";
+  if (!L.tall || asRows) {
+    const cols = asRows ? COMPARE_COLUMNS.filter((col) => COMPARE_ROW_KEYS.includes(col.key)) : COMPARE_COLUMNS;
+    let labelSize = 12 * s, headH = labelSize + 14 * s;
+    // Fewer items get taller rows and bigger figures, up to a point.
+    const rowH = Math.min((asRows ? 100 : 84) * s, (area.h - headH) / rows.length);
+    const base = clamp(rowH * (asRows ? 0.2 : 0.27), 13 * s, 18 * s);
+    let nameW = area.w * 0.2, size, widths;
+    if (asRows) {
+      // A name goes on a line of its own above its figures, which leaves them the whole
+      // width. Each column is as wide as its heading or its widest figure needs: all of
+      // them shrink alike to fit, and share out any width left over.
+      const need = cols.map((col) => 14 * s + Math.max(measure(col.short, labelSize, 600),
+        ...rows.map((row) => runWidth(segmentsOf(row, col), base, 600, COIN_SCALE) + base * 0.8)));
+      const needed = need.reduce((sum, width) => sum + width, 0), share = Math.min(1, area.w / needed);
+      const spare = (area.w - needed * share) / (cols.length + 1);
+      widths = need.map((width) => width * share + spare);
+      size = base * share;
+      labelSize *= share;
+      headH = labelSize + 14 * s;
+      nameW = spare;
+    } else {
+      widths = cols.map(() => (area.w - nameW) / cols.length);
+      size = fittedSize(base, cols, widths[0] - 6 * s);
+    }
+    const right = (k) => area.x + nameW + widths.slice(0, k + 1).reduce((sum, width) => sum + width, 0) - 4 * s;
     let headSvg = text(area.x, area.y + labelSize, periods ? "Period" : "Item", { size: labelSize, weight: 600, fill: C.text3 });
-    COMPARE_COLUMNS.forEach((col, k) => {
-      headSvg += text(right(k), area.y + labelSize, fit(col.short, colW - 8 * s, labelSize), { size: labelSize, weight: 600, fill: C.text3, anchor: "end" });
+    cols.forEach((col, k) => {
+      headSvg += text(right(k), area.y + labelSize, fit(col.short, widths[k] - 8 * s, labelSize), { size: labelSize, weight: 600, fill: C.text3, anchor: "end" });
     });
     headSvg += line(area.x, area.y + headH - 1, area.x + area.w, area.y + headH - 1, C.axis);
     out += reveal("0.020", headSvg);
-    // Fewer items get taller rows and bigger figures, up to a point.
-    const rowH = Math.min(84 * s, (area.h - headH) / rows.length);
-    const size = fittedSize(clamp(rowH * 0.27, 13 * s, 18 * s), COMPARE_COLUMNS, colW - 6 * s);
     rows.forEach((row, i) => {
-      const y = area.y + headH + rowH * i, middle = y + rowH / 2, baseline = middle + size * 0.35;
-      const box = Math.min(36 * s, rowH * 0.62);
-      let rowSvg = itemLabel(area.x, middle - box / 2, box, row, nameW - 8 * s, size);
-      COMPARE_COLUMNS.forEach((col, k) => {
+      const y = area.y + headH + rowH * i, middle = y + rowH * (asRows ? 0.7 : 0.5), baseline = middle + size * 0.35;
+      const box = asRows ? Math.min(size * 1.5, rowH * 0.34) : Math.min(36 * s, rowH * 0.62);
+      let rowSvg = asRows ? itemLabel(area.x, y + rowH * 0.3 - box / 2, box, row, area.w, size * 0.9)
+        : itemLabel(area.x, middle - box / 2, box, row, nameW - 8 * s, size);
+      cols.forEach((col, k) => {
+        const colW = widths[k];
         rowSvg += drawValue(right(k), baseline, row, col, size);
         const note = noteOf(row, col);
         if (note) rowSvg += run(right(k), baseline + size * 0.95, note, { size: size * 0.66, fill: C.text2, anchor: "end" });
