@@ -1,6 +1,6 @@
 local _, F = ...
 F.context = {}
-F.pendingPosts, F.mailCache = {}, {}
+F.pendingPosts, F.mailLeaving, F.cancelling = {}, {}, {}
 
 function F.Call(fn, ...)
     if type(fn) ~= "function" then return nil end
@@ -97,7 +97,7 @@ function F.ScanAuctions()
         for i=1,count do
             local v={F.Call(GetAuctionItemInfo,"owner",i)}
             rows[#rows+1]={item=F.Item(F.Call(GetAuctionItemLink,"owner",i),v[17],v[1]),
-                quantity=v[3],status=v[16],totalBuyout=v[10],bid=v[11],legacy=true}
+                quantity=v[3],status=v[16],totalBuyout=v[10],bid=v[11],minBid=v[8],legacy=true}
         end
         F.Snapshot("auctions",rows,count==total,{legacy=true}); return
     end
@@ -153,60 +153,363 @@ function F.ReadMail(index)
         commission=F.Number(v[7]),counterparty=v[3],failure=failure}
 end
 
+-- Taking mail is only proven by the mail changing. Clients differ in what they confirm:
+-- TBC sends no MAIL_SUCCESS with an item, and mail addons retry takes that already paid.
+local function mailKey(m) return F.JSON({m.sender or "",m.subject or ""}) end
+F.MailKey=mailKey
+
+-- What left one mail between two reads, or nil if nothing did.
+local function taken(before,after)
+    local left={}
+    local function attachment(r) return tostring(r.item.link)..":"..tostring(r.quantity) end
+    for _,r in ipairs(after and after.items or {}) do
+        left[attachment(r)]=(left[attachment(r)] or 0)+1
+    end
+    local items={}
+    for _,r in ipairs(before.items) do
+        local key=attachment(r)
+        if (left[key] or 0)>0 then left[key]=left[key]-1 else items[#items+1]=r end
+    end
+    local money=before.money-(after and after.money or 0)
+    if money<=0 and #items==0 then return nil end
+    local mail=F.Copy(before)
+    mail.money,mail.items=math.max(money,0),items
+    mail.cod=math.max(before.cod-(after and after.cod or 0),0)
+    mail.mode=money<=0 and "item" or #items>0 and "all" or "money"
+    return mail
+end
+
+-- What left the mailbox between two complete reads. Mails with the same sender and
+-- subject are interchangeable, and unchanged ones cancel out first.
+function F.MailTaken(before,after)
+    local now,result={},{}
+    for _,m in ipairs(after) do
+        local key=mailKey(m)
+        now[key]=now[key] or {}
+        table.insert(now[key],m)
+    end
+    local changed={}
+    for _,b in ipairs(before) do
+        local rows,same=now[mailKey(b)] or {},nil
+        for i,a in ipairs(rows) do
+            if a.money==b.money and #a.items==#b.items then same=i; break end
+        end
+        if same then table.remove(rows,same) else changed[#changed+1]=b end
+    end
+    for _,b in ipairs(changed) do
+        local key=mailKey(b)
+        local a=now[key] and table.remove(now[key],1)
+        if not a and (F.mailLeaving[key] or 0)>0 then
+            F.mailLeaving[key]=F.mailLeaving[key]-1
+        else
+            local mail=taken(b,a)
+            if mail then result[#result+1]=mail end
+        end
+    end
+    return result
+end
+
+function F.CollectMail(before,after)
+    for _,mail in ipairs(F.MailTaken(before,after)) do
+        F.Emit("mail_collected",mail)
+        if mail.cod>0 then F.Claim("mail_cod",-mail.cod,{sender=mail.sender,items=mail.items}) end
+        F.Invoice(mail)
+    end
+end
+
+-- Whether two mailbox reads can be compared. A mail that was read but is loading again
+-- would look collected, so more unreadable mails than before must be new arrivals. A
+-- mail the client never loads is just left out, so the others are still followed.
+function F.MailComparable(before,after)
+    return after.unreadable-before.unreadable<=math.max(after.count-before.count,0)
+end
+
 function F.ScanMail()
     if not F.context.mail then return end
     local count,total=F.Call(GetInboxNumItems)
     if not count then return end
-    local rows,cache={},{}
+    local rows={}
     for index=1,count do
         local mail=F.ReadMail(index)
-        if mail then cache[index]=mail; rows[#rows+1]=mail end
+        if mail then rows[#rows+1]=mail end
     end
-    F.mailCache=cache
+    local read={count=count,unreadable=count-#rows}
+    if not F.mailSeen or F.MailComparable(F.mailRead,read) then
+        if F.mailSeen then F.CollectMail(F.mailSeen,rows) end
+        F.mailSeen,F.mailRead=rows,read
+    end
     F.Snapshot("mail",rows,#rows==count and (not total or count>=total),{visible=count,total=total})
 end
 
--- Fields a take does not change, unlike money and attachments.
-local function mailIdentity(m)
-    return F.JSON({sender=m.sender,subject=m.subject,invoiceType=m.invoiceType,gross=m.gross,
-        counterparty=m.counterparty})
+-- A returned or deleted mail also leaves the mailbox, but nobody received its contents.
+function F.MailLeaving(index)
+    local mail=F.ReadMail(index)
+    if mail and (mail.money>0 or #mail.items>0) then
+        local key=mailKey(mail)
+        F.mailLeaving[key]=(F.mailLeaving[key] or 0)+1
+    end
 end
 
-function F.TakeMail(index, mode, slot)
-    -- Only one mail command is accepted at once by the client. Do not replace
-    -- the first command's cached identity on repeated clicks.
-    if F.pendingMail then return end
-    -- Indices shift when a mail is deleted, and the cache is only rebuilt on the
-    -- next tick. Trust a cached entry only while it still describes this mail.
-    local live,cached=F.ReadMail(index),F.mailCache[index]
-    local mail=cached
-    if live and not (cached and mailIdentity(cached)==mailIdentity(live)) then mail=live end
-    if not mail then return end
-    mail=F.Copy(mail)
-    mail.mode,mail.slot,mail.started=mode,slot,F.Clock()
-    if mode=="item" then mail.money=0 end
-    if mode=="money" then mail.items={}; mail.cod=0 end
-    F.pendingMail=mail
+-- Earlier versions lost mail collected while a take went unconfirmed, and could record a
+-- retried take twice. Past mailbox reads show what really left the inbox. A correction
+-- is only made when it equals, to the copper, the gold nothing explained at the time.
+local BACKFILL_GAP,BACKFILL_LEAD,BACKFILL_SETTLE=60,5,10
+
+local function backfillRecord(kind,data,source,time)
+    data.occurredAt,data.backfilled=time,true
+    local e=F.Emit(kind,data)
+    e.character,e.characterName,e.realm=source.character,source.characterName,source.realm
+    e.session,e.episode=source.session,source.episode
+    return e
 end
 
-function F.MailSuccess(itemID)
-    local mail=F.pendingMail
-    if not mail then return end
-    if mail.mode=="money" and itemID~=nil then return end
-    if mail.mode=="item" and itemID==nil then return end
-    if mail.mode=="all" and mail.money>0 and itemID~=nil then return end
-    F.pendingMail=nil
-    if F.Clock()-mail.started>30 then
-        F.Emit("diagnostic",{message="Stale mail confirmation",mail=mail}); return
+local function backfillAdd(mail,source,time)
+    backfillRecord("mail_collected",F.Copy(mail),source,time)
+    if mail.invoiceType=="seller" then
+        local sale=F.Copy(mail)
+        sale.matchConfidence="unmatched"
+        local e=backfillRecord("auction_sale",sale,source,time)
+        backfillRecord("activity",{category="auction_sale",amount=mail.money,confidence="backfilled_snapshot",saleID=e.id,
+            item=mail.item,gross=mail.gross,commission=mail.commission,depositRefund=mail.depositRefund,quantity=mail.quantity},source,time)
+    else
+        local d=F.Copy(mail)
+        d.category,d.amount,d.confidence="mail_received",mail.money,"backfilled_snapshot"
+        backfillRecord("activity",d,source,time)
     end
-    if mail.mode=="item" then
-        local selected={}
-        for _, item in ipairs(mail.items) do if item.slot==mail.slot then selected[1]=item end end
-        mail.items=selected
+end
+
+-- Cancels a recorded take that paid nothing, keeping the record itself.
+local function backfillVoid(entry,source,time)
+    local a=entry.activity
+    backfillRecord("activity",{category=a.data.category,amount=-a.data.amount,confidence="backfilled_snapshot",
+        item=a.data.item,correctsActivityID=a.id,correctsSaleID=a.data.saleID},source,time)
+end
+
+-- One burst of corrections and the unexplained gold around it.
+local function backfillCluster(cluster,session,result)
+    local first,last=cluster[1].time,cluster[#cluster].time
+    local net,residual,ids,added,removed=0,0,{},0,0
+    for _,c in ipairs(cluster) do
+        net=net+c.amount
+        if c.amount>0 then added=added+1 else removed=removed+1 end
     end
-    F.Emit("mail_collected",mail)
-    if mail.cod>0 then F.Claim("mail_cod",-mail.cod,{sender=mail.sender,items=mail.items}) end
-    F.Invoice(mail)
+    for _,r in ipairs(session.unresolved) do
+        if r.time>=first-BACKFILL_LEAD and r.time<=last+BACKFILL_SETTLE then
+            residual=residual+r.data.residual; ids[#ids+1]=r.id
+        end
+    end
+    local applied=net==residual
+    if applied then
+        for _,c in ipairs(cluster) do
+            if c.amount>0 then backfillAdd(c.mail,session.source,c.time) else backfillVoid(c,session.source,c.time) end
+        end
+        result.added,result.removed,result.amount=result.added+added,result.removed+removed,result.amount+net
+    else result.skipped=result.skipped+1 end
+    backfillRecord("mail_backfill",{status=applied and "applied" or "skipped",added=added,removed=removed,amount=net,
+        residual=residual,reconciliationIDs=ids},session.source,first)
+end
+
+-- 2: also follows reads where one mail never loaded. Running again skips what an
+-- earlier pass corrected, so nothing is recovered or voided twice.
+local BACKFILL_VERSION=2
+
+function F.BackfillMail()
+    local db=F.db
+    local done=db.mailBackfilled==true and 1 or tonumber(db.mailBackfilled) or 0
+    if done>=BACKFILL_VERSION then return end
+    db.mailBackfilled=BACKFILL_VERSION
+    local sessions,order,sales,settled,voided={},{},{},{},{}
+    for _,e in ipairs(db.events) do
+        local d=e.data
+        if (e.kind=="mail_backfill" or e.kind=="vendor_backfill") and d.status=="applied" then
+            for _,id in ipairs(d.reconciliationIDs or {}) do settled[id]=true end
+        elseif e.kind=="activity" and d.correctsActivityID then voided[d.correctsActivityID]=true end
+    end
+    local function sessionOf(e)
+        local key=e.character..":"..tostring(e.session)
+        if not sessions[key] then
+            sessions[key]={source=e,found={},recorded={},unresolved={}}
+            order[#order+1]=sessions[key]
+        end
+        return sessions[key]
+    end
+    for _,e in ipairs(db.events) do
+        local d=e.data
+        if e.kind=="snapshot" and d.location=="mail" then
+            local s=sessionOf(e)
+            -- The same rule as ScanMail. Reads keep no record of the mailbox closing, so a
+            -- later visit that starts with a mail still loading begins afresh, as ScanMail
+            -- does on opening.
+            local count=(d.metadata or {}).visible or #d.rows
+            local read={count=count,unreadable=count-#d.rows}
+            local comparable=s.seen and F.MailComparable(s.read,read)
+            local fresh=s.seen and not comparable and e.time-s.readAt>BACKFILL_GAP
+            if not s.seen or comparable or fresh then
+                if comparable then
+                    for _,mail in ipairs(F.MailTaken(s.seen,d.rows)) do
+                        if mail.money>0 then s.found[#s.found+1]={mail=mail,time=e.time,amount=mail.money} end
+                    end
+                end
+                s.seen,s.read=d.rows,read
+            end
+            s.readAt=e.time
+        elseif e.kind=="auction_sale" then sales[e.id]=e
+        elseif e.kind=="reconciliation" and d.status=="unresolved" and not settled[e.id] then
+            local s=sessionOf(e)
+            s.unresolved[#s.unresolved+1]=e
+        elseif e.kind=="activity" and (d.amount or 0)>0 and not voided[e.id] then
+            local mail=d.saleID and sales[d.saleID] and sales[d.saleID].data or d.category=="mail_received" and d
+            if mail then
+                local s=sessionOf(e)
+                s.recorded[#s.recorded+1]={key=F.MailKey(mail),money=d.amount,activity=e}
+            end
+        end
+    end
+    local result={added=0,removed=0,amount=0,skipped=0}
+    for _,s in ipairs(order) do
+        local changes={}
+        for _,f in ipairs(s.found) do
+            local key,matched=F.MailKey(f.mail),false
+            for i,r in ipairs(s.recorded) do
+                if r.key==key and r.money==f.mail.money then table.remove(s.recorded,i); matched=true; break end
+            end
+            if not matched then changes[#changes+1]=f end
+        end
+        for _,r in ipairs(s.recorded) do
+            changes[#changes+1]={activity=r.activity,time=r.activity.time,amount=-r.money}
+        end
+        table.sort(changes,function(a,b) return a.time<b.time end)
+        local cluster={}
+        for _,c in ipairs(changes) do
+            if cluster[1] and c.time-cluster[#cluster].time>BACKFILL_GAP then
+                backfillCluster(cluster,s,result); cluster={}
+            end
+            cluster[#cluster+1]=c
+        end
+        if cluster[1] then backfillCluster(cluster,s,result) end
+    end
+    if result.added+result.removed>0 and F.Print then
+        F.Print("Recovered "..result.added.." missed mail collections from earlier records.")
+    end
+    return result
+end
+
+-- Earlier versions queued another vendor-sale intent each time a sell-junk loop used an
+-- item again, so the sales never added up to the gold received. Taken once per item and
+-- amount, the intents just before an unexplained gain are its sales only if they equal
+-- it to the copper.
+local VENDOR_LOOKBACK=30
+
+function F.RepairVendorSales()
+    local db=F.db
+    if db.vendorSalesRepaired then return end
+    db.vendorSalesRepaired=true
+    local settled,used,intents={},{},{}
+    for _,e in ipairs(db.events) do
+        local d=e.data
+        if (e.kind=="mail_backfill" or e.kind=="vendor_backfill") and d.status=="applied" then
+            for _,id in ipairs(d.reconciliationIDs or {}) do settled[id]=true end
+        elseif e.kind=="activity" and d.intentID then used[d.intentID]=true end
+    end
+    local result={added=0,amount=0}
+    for index=1,#db.events do
+        local e=db.events[index]
+        local d=e.data
+        if e.kind=="intent" and d.category=="vendor_sale" and not used[e.id] then
+            intents[e.character]=intents[e.character] or {}
+            table.insert(intents[e.character],e)
+        elseif e.kind=="reconciliation" and d.status=="unresolved" and (d.residual or 0)>0 and not settled[e.id] then
+            local seen,chosen,sum={},{},0
+            for _,i in ipairs(intents[e.character] or {}) do
+                if not used[i.id] and i.time<=e.time and e.time-i.time<=VENDOR_LOOKBACK then
+                    local item=i.data.details and i.data.details.item
+                    local key=tostring(item and item.link)..":"..i.data.amount
+                    if not seen[key] then seen[key]=true; chosen[#chosen+1]=i; sum=sum+i.data.amount end
+                end
+            end
+            if chosen[1] and sum==d.residual then
+                for _,i in ipairs(chosen) do
+                    local c=F.Copy(i.data.details or {})
+                    c.category,c.amount,c.confidence,c.intentID="vendor_sale",i.data.amount,"backfilled_intents",i.id
+                    backfillRecord("activity",c,e,e.time)
+                    used[i.id]=true
+                end
+                backfillRecord("vendor_backfill",{status="applied",added=#chosen,amount=sum,residual=d.residual,
+                    reconciliationIDs={e.id}},e,e.time)
+                result.added,result.amount=result.added+#chosen,result.amount+sum
+            end
+        end
+    end
+    if result.added>0 and F.Print then
+        F.Print("Recovered "..result.added.." missed vendor sales from earlier records.")
+    end
+    return result
+end
+
+-- GetSendMailPrice includes the money being sent on some clients and not on others. Every
+-- send pays at least 30 copper an attachment, so what is left after the money tells which.
+local POSTAGE_PER_ATTACHMENT=30
+
+function F.MailPostage(price,money,attachments)
+    if price and price-money>=POSTAGE_PER_ATTACHMENT*math.max(attachments,1) then return price-money end
+    return price
+end
+
+local function repairPostage(entries,residual,ids,result)
+    local over,first=0,entries[1].activity
+    for _,w in ipairs(entries) do over=over+w.over end
+    local applied=over==residual
+    if applied then
+        for _,w in ipairs(entries) do
+            local a=w.activity
+            backfillVoid(w,a,a.time)
+            backfillRecord("activity",{category="postage",amount=-w.postage,confidence="backfilled_snapshot",
+                recipient=a.data.recipient},a,a.time)
+        end
+        result.fixed,result.amount=result.fixed+#entries,result.amount+over
+    else result.skipped=result.skipped+#entries end
+    backfillRecord("mail_backfill",{repair="postage",status=applied and "applied" or "skipped",added=0,removed=0,
+        amount=over,residual=residual,reconciliationIDs=ids},first,first.time)
+end
+
+-- Earlier versions also booked the money sent as postage. Sent mail records show how much,
+-- and as with BackfillMail a correction must equal, to the copper, the gold left unexplained.
+function F.RepairPostage()
+    local db=F.db
+    if db.postageRepaired then return end
+    db.postageRepaired=true
+    local sent,wrong,groups={},{},{}
+    for _,e in ipairs(db.events) do
+        local d=e.data
+        if e.kind=="mail_sent" then sent[e.character]=e
+        elseif e.kind=="activity" and d.category=="postage" then
+            local mail=sent[e.character]
+            sent[e.character]=nil
+            if mail and -d.amount==mail.data.postage then
+                local postage=F.MailPostage(mail.data.postage,mail.data.money or 0,#(mail.data.items or {}))
+                if postage~=mail.data.postage then
+                    local w={activity=e,postage=postage,over=mail.data.postage-postage}
+                    wrong[#wrong+1]=w; wrong[e.id]=w
+                end
+            end
+        elseif e.kind=="reconciliation" and d.status=="unresolved" then
+            local entries={}
+            for _,id in ipairs(d.activityIDs or {}) do
+                local w=wrong[id]
+                if w then entries[#entries+1]=w; w.settled=true end
+            end
+            if entries[1] then groups[#groups+1]={entries=entries,residual=d.residual,ids={e.id}} end
+        end
+    end
+    for _,w in ipairs(wrong) do
+        if not w.settled then groups[#groups+1]={entries={w},residual=0,ids={}} end
+    end
+    local result={fixed=0,amount=0,skipped=0}
+    for _,g in ipairs(groups) do repairPostage(g.entries,g.residual,g.ids,result) end
+    if result.fixed>0 and F.Print then
+        F.Print("Corrected postage on "..result.fixed.." sent mails from earlier records.")
+    end
+    return result
 end
 
 function F.UpdateTrade()
@@ -251,7 +554,19 @@ function F.CapturePost(location,duration,quantity,bid,buyout,commodity,confirm)
     else deposit=F.Call(api.CalculateItemDeposit,location,duration,quantity) end
     local d={item=item,duration=duration,quantity=F.Number(quantity),deposit=F.Number(deposit),
         totalPrice=commodity and (F.Number(buyout) or 0)*(F.Number(quantity) or 0) or F.Number(buyout),
-        bid=F.Number(bid),commodity=commodity,clock=F.Clock()}
+        bid=F.Number(bid),commodity=commodity,clock=F.Clock(),
+        guid=F.Call(C_Item and C_Item.GetItemGUID,location),
+        stack=F.Number(F.Call(C_Item and C_Item.GetStackCount,location))}
+    -- Posting several of a non-commodity item makes one auction per item, each at the full
+    -- buyout. Forever (1.60.1) sends no AUCTION_MULTISELL_START for it, and charges each
+    -- auction the single-item deposit (at least 1 silver), not a share of the total.
+    if not commodity and d.quantity and d.quantity>1 then
+        d.multisell=d.quantity
+        d.auctionDeposit=F.Number(F.Call(api.CalculateItemDeposit,location,duration,1))
+    end
+    -- Forever refuses an item (not commodity) buyout with copper in it, without any error
+    -- event: 77 of 77 whole-silver item posts made an auction, the one at 899 copper did not.
+    if not commodity and d.totalPrice and d.totalPrice%100~=0 then d.doubt="copper_price" end
     local function same(p) return p.item.link==d.item.link and p.quantity==d.quantity and p.totalPrice==d.totalPrice end
     -- A Confirm* call completes a warned post; it is the same auction, not another one.
     if confirm then
@@ -262,41 +577,119 @@ function F.CapturePost(location,duration,quantity,bid,buyout,commodity,confirm)
     end
     local last=F.pendingPosts[#F.pendingPosts]
     if last and d.clock-last.clock<0.2 and same(last) then return end
+    -- Posting the very item an earlier post took whole means that post made no auction:
+    -- had it worked, the item would have left the bags.
+    if d.guid then
+        local keep={}
+        for _, p in ipairs(F.pendingPosts) do
+            local whole=p.stack and p.quantity and p.quantity>=p.stack
+            if not (p.guid==d.guid and whole) then keep[#keep+1]=p end
+        end
+        F.pendingPosts=keep
+    end
     F.pendingPosts[#F.pendingPosts+1]=d
     F.Emit("auction_post_intent",d)
 end
 
 -- One multisell call creates `multisell` separate auctions sharing the quantity
--- and deposit; rounding remainders fall to the later auctions.
+-- and deposit; rounding remainders fall to the later auctions. A known per-auction
+-- deposit replaces the share.
 local function nextAuction(d)
     local n=d.multisell
     d.multisell=nil
-    if not n or n<2 then return d,true end
+    if not n or n<2 then
+        if n and d.auctionDeposit then d.deposit=d.auctionDeposit end
+        d.auctionDeposit=nil
+        return d,true
+    end
     local one=F.Copy(d)
     one.quantity=d.quantity and math.floor(d.quantity/n)
-    one.deposit=d.deposit and math.floor(d.deposit/n)
+    one.deposit=d.auctionDeposit or d.deposit and math.floor(d.deposit/n)
+    one.auctionDeposit=nil
     d.quantity=d.quantity and d.quantity-one.quantity
     d.deposit=d.deposit and d.deposit-one.deposit
     d.multisell=n-1; d.clock=F.Clock()
     return one,false
 end
 
+-- The created auction as the owned-auctions list shows it, if the list has it yet.
+local function ownedAuction(id)
+    local api=C_AuctionHouse
+    local owned=api and F.Call(api.GetOwnedAuctions)
+    if type(owned)~="table" then return nil end
+    for _, a in ipairs(owned) do
+        if F.Number(a.auctionID)==F.Number(id) then return a end
+    end
+end
+
+-- The owned list gives an item auction's own buyout, and a commodity's unit price
+-- (65 of 66 fresh Forever listings; a sold one showed the total, so either is accepted).
+local function postFits(p, a)
+    local link=type(a.itemLink)=="string" and a.itemLink or ""
+    local itemID=F.Number(a.itemKey and a.itemKey.itemID) or tonumber(link:match("item:(%d+)"))
+    if not (p.item and p.item.id and p.item.id==itemID) then return false end
+    local quantity=F.Number(a.quantity)
+    local buyout=F.Number(a.buyoutAmount)
+    if p.commodity then
+        return quantity==p.quantity and buyout~=nil and (buyout*quantity==p.totalPrice or buyout==p.totalPrice)
+    end
+    if p.multisell then
+        if quantity~=1 then return false end
+    elseif quantity~=p.quantity then return false end
+    if buyout and buyout>0 then return buyout==p.totalPrice end
+    return F.Number(a.bidAmount)==p.bid
+end
+
+-- The server handles posts in the order they were sent, so the created auction is the
+-- oldest sent post, unless the owned list says otherwise or that post was likely refused.
+-- Sent posts queued before the one chosen never made an auction and are dropped.
 function F.Created(id)
     if F.db.auctions[F.AuctionKey(id)] then return end
-    local keep,d={},nil
+    local live={}
     for _, p in ipairs(F.pendingPosts) do
-        if F.Clock()-p.clock<30 then
-            -- A post waiting on its warning dialog has not created anything yet.
-            if not d and not p.awaitingConfirm then d=p else keep[#keep+1]=p end
+        if F.Clock()-p.clock<30 then live[#live+1]=p end
+    end
+    -- A post waiting on its warning dialog has not created anything yet.
+    local function find(test)
+        for i, p in ipairs(live) do
+            if not p.awaitingConfirm and test(p) then return i end
         end
     end
-    if d then
-        local post,last=nextAuction(d)
-        if not last then table.insert(keep,1,d) end
-        d=post; d.clock=nil; d.matchConfidence="ordered_confirmation"
+    local owned=ownedAuction(id)
+    local pick,confidence
+    if owned then
+        pick=find(function(p) return postFits(p,owned) end)
+        confidence="owned_auction"
+    else
+        pick=find(function(p) return not p.doubt end) or find(function() return true end)
+        confidence="ordered_confirmation"
+    end
+    local keep,d={},nil
+    for i, p in ipairs(live) do
+        if i>(pick or 0) or p.awaitingConfirm then keep[#keep+1]=p end
+    end
+    if pick then
+        local post,last=nextAuction(live[pick])
+        if not last then table.insert(keep,1,live[pick]) end
+        d=post; d.clock=nil; d.doubt=nil; d.guid=nil; d.stack=nil; d.matchConfidence=confidence
+    elseif owned then
+        -- No post fits what the server listed; its listing is better than a wrong guess.
+        d={item=F.Item(owned.itemLink,owned.itemKey and owned.itemKey.itemID),
+            quantity=F.Number(owned.quantity),matchConfidence="owned_auction_only"}
+        keep=live
     end
     F.pendingPosts=keep
     F.Posted(id,d)
+end
+
+-- A merchant item's price, stack size and name. Newer clients, Forever among them,
+-- moved these into C_MerchantFrame.GetItemInfo, which returns a table, and dropped
+-- GetMerchantItemInfo, so a buy there used to leave no record of what was bought.
+function F.MerchantItem(index)
+    local info=C_MerchantFrame and F.Call(C_MerchantFrame.GetItemInfo,index)
+    if type(info)=="table" then return F.Number(info.price),F.Number(info.stackCount),info.name end
+    local v={F.Call(GetMerchantItemInfo,index)}
+    return F.Number(v[3]),F.Number(v[4]),v[1]
 end
 
 function F.InstallHooks()
@@ -310,7 +703,26 @@ function F.InstallHooks()
     Hook(api,"PlaceBid",function(id,amount)
         F.Intent("auction_purchase_or_bid",-amount,{auctionID=id})
     end)
+    -- A legacy post charges each stack as it is created. The item is still in the sell
+    -- slot when this runs. A post the client refuses simply leaves its intents unmatched.
+    Hook("PostAuction",function(bid,buyout,runTime,stackSize,numStacks)
+        if not F.LegacyAH() then return end
+        local deposit=F.Number(F.Call(GetAuctionDeposit,runTime,bid,buyout,stackSize,1))
+        if not deposit then return end
+        local v={F.Call(GetAuctionSellItemInfo)}
+        local item=F.Item(nil,v[10],v[1])
+        numStacks=F.Number(numStacks) or 1
+        for _=1,numStacks do
+            F.Intent("auction_deposit",-deposit,{item=item,quantity=stackSize},15+numStacks*2)
+        end
+    end)
+    Hook("PlaceAuctionBid",function(list,index,bid)
+        bid=F.Number(bid)
+        local quantity=F.Number(select(3,F.Call(GetAuctionItemInfo,list,index)))
+        if bid then F.Intent("auction_purchase_or_bid",-bid,{item=F.Item(F.Call(GetAuctionItemLink,list,index)),quantity=quantity}) end
+    end)
     Hook(api,"CancelAuction",function(id)
+        F.cancelling[F.AuctionKey(id)]=F.Clock()
         local cost=F.Number(F.Call(api.GetCancelCost,id))
         if cost and cost>0 then F.Intent("auction_cancel_fee",-cost,{auctionID=id,auctionKey=F.AuctionKey(id)}) end
     end)
@@ -319,15 +731,12 @@ function F.InstallHooks()
             F.Intent("auction_purchase",-F.commodityQuote.total,{item=F.Item(nil,id),quantity=quantity})
         end
     end)
-    Hook("TakeInboxMoney",function(i) F.TakeMail(i,"money") end)
-    Hook("AutoLootMailItem",function(i) F.TakeMail(i,"all") end)
-    Hook("TakeInboxItem",function(i,s) F.TakeMail(i,"item",s or 1) end)
+    Hook("ReturnInboxItem",F.MailLeaving)
+    Hook("DeleteInboxItem",F.MailLeaving)
     Hook("SendMail",function(recipient)
         if F.pendingSend then return end
         local money=F.Number(F.Call(GetSendMailMoney)) or 0
-        -- GetSendMailPrice is postage only; the send frame adds the money on top.
-        local d={recipient=F.FullName(recipient),money=money,cod=F.Number(F.Call(GetSendMailCOD)),
-            postage=F.Number(F.Call(GetSendMailPrice)),items={}}
+        local d={recipient=F.FullName(recipient),money=money,cod=F.Number(F.Call(GetSendMailCOD)),items={}}
         for i=1,(ATTACHMENTS_MAX_SEND or 12) do
             local link=F.Call(GetSendMailItemLink,i)
             if link then
@@ -335,6 +744,7 @@ function F.InstallHooks()
                 d.items[#d.items+1]={item=F.Item(link),quantity=F.Number(v[4]) or 1}
             end
         end
+        d.postage=F.MailPostage(F.Number(F.Call(GetSendMailPrice)),money,#d.items)
         F.pendingSend=d
     end)
     local function tradeMoney(amount) if F.trade then F.trade.moneyOut=F.Number(amount) end end
@@ -343,9 +753,18 @@ function F.InstallHooks()
         if not F.context.merchant then return end
         local info=F.Call(C_Container.GetContainerItemInfo,bag,slot)
         if info then
+            -- Sell-junk loops use the same slot again until the item has gone. One sale
+            -- is one intent, or the duplicates stop the batch from adding up.
+            for _,i in ipairs(F.intents) do
+                local d=i.event.data.details
+                if not i.used and F.Clock()-i.clock<i.window and i.event.data.category=="vendor_sale"
+                    and d and d.bag==bag and d.slot==slot and d.item and d.item.link==info.hyperlink then
+                    i.clock=F.Clock(); F.Touch(); return
+                end
+            end
             local item=F.Item(info.hyperlink,info.itemID)
             if item.vendorPrice then F.Intent("vendor_sale",item.vendorPrice*info.stackCount,
-                {item=item,quantity=info.stackCount}) end
+                {item=item,quantity=info.stackCount,bag=bag,slot=slot}) end
         end
     end)
     Hook(C_MerchantFrame,"SellAllJunkItems",function()
@@ -363,10 +782,10 @@ function F.InstallHooks()
         F.Intent("vendor_sale",total,{items=items,method="sell_junk"})
     end)
     Hook("BuyMerchantItem",function(index,quantity)
-        local v={F.Call(GetMerchantItemInfo,index)}
-        local price,stack=F.Number(v[3]),F.Number(v[4])
+        local price,stack,name=F.MerchantItem(index)
+        local link=F.Call(GetMerchantItemLink,index) or (C_MerchantFrame and F.Call(C_MerchantFrame.GetItemLink,index))
         if price and stack and stack>0 then F.Intent("vendor_purchase",-math.floor(price*(quantity or 1)/stack),
-            {item=F.Item(F.Call(GetMerchantItemLink,index)),quantity=quantity or 1}) end
+            {item=F.Item(link,F.Call(GetMerchantItemID,index),name),quantity=quantity or 1}) end
     end)
     Hook("BuybackItem",function(index)
         local v={F.Call(GetBuybackItemInfo,index)}
@@ -374,20 +793,35 @@ function F.InstallHooks()
             {item=F.Item(F.Call(GetBuybackItemLink,index)),quantity=v[4]}) end
     end)
     Hook("RepairAllItems",function(guild)
-        if not guild and F.repairCost then F.Intent("repair",-F.repairCost,{}) end
+        if not guild and F.repairCost then F.Intent("repair",-F.repairCost,F.WithStanding({})) end
     end)
     Hook("TakeTaxiNode",function(index)
         local price=F.Number(F.Call(TaxiNodeCost,index))
         if price then F.Intent("flight",-price,{destination=F.Call(TaxiNodeName,index)}) end
     end)
+    -- Whether the trainer teaches a profession tells class spells from recipes; a
+    -- client without the function leaves it unknown rather than guessing.
     Hook("BuyTrainerService",function(index)
         local cost=F.Number(F.Call(GetTrainerServiceCost,index))
-        if cost then F.Intent("training",-cost,{service=F.Call(GetTrainerServiceInfo,index)}) end
+        if not cost then return end
+        local d={service=F.Call(GetTrainerServiceInfo,index),skillLine=F.Call(GetTrainerServiceSkillLine,index)}
+        if type(IsTradeskillTrainer)=="function" then d.trainer=F.Call(IsTradeskillTrainer) and "profession" or "class" end
+        F.Intent("training",-cost,F.WithStanding(d))
     end)
     for _, def in ipairs({{"DepositMoney","bank_deposit",-1},{"WithdrawMoney","bank_withdrawal",1}}) do
         local name,category,sign=def[1],def[2],def[3]
         Hook(C_Bank,name,function(bankType,amount) F.Intent(category,sign*amount,{bankType=bankType}) end)
     end
+end
+
+-- A repair or training cost already has any reputation discount taken off. The
+-- NPC's reaction to the player is that standing; it and this client's discount for
+-- it are kept, so the full price can be worked out later from the record alone.
+function F.WithStanding(d)
+    d.standing=F.Number(F.Call(UnitReaction,"npc","player"))
+    d.discount=F.ReputationDiscount(d.standing)
+    d.npc=F.Call(GetUnitName,"npc",true)
+    return d
 end
 
 function F.ParseMoney(text)
@@ -434,22 +868,22 @@ F.events={
     AUCTION_MULTISELL_START=function(count)
         local d=F.pendingPosts[#F.pendingPosts]
         count=F.Number(count)
-        if d and count and count>1 then d.multisell=count end
+        if d and count and count>1 and not d.multisell then d.multisell=count end
     end,
     AUCTION_HOUSE_POST_WARNING=function()
         local d=F.pendingPosts[#F.pendingPosts]
         if d then d.awaitingConfirm=true end
     end,
-    AUCTION_CANCELED=function(id) F.AuctionOutcome(F.AuctionKey(id),"cancelled","server_id") end,
+    AUCTION_CANCELED=function(id) F.AuctionLeft(id) end,
     AUCTION_HOUSE_AUCTIONS_EXPIRED=function(id) F.AuctionOutcome(F.AuctionKey(id),"expired","server_id") end,
     COMMODITY_PRICE_UPDATED=function(unit,total) F.commodityQuote={unit=F.Number(unit),total=F.Number(total)} end,
     COMMODITY_PURCHASE_FAILED=function() F.commodityQuote=nil end,
     AUCTION_HOUSE_PURCHASE_COMPLETED=function(id) F.Emit("auction_purchase_confirmed",{auctionID=id}) end,
     MAIL_SHOW=function() F.context.mail=true; F.ScanMail() end,
     MAIL_INBOX_UPDATE=function() F.mailDirty=true end,
-    MAIL_CLOSED=function() F.context.mail=nil; F.mailCache={} end,
-    MAIL_SUCCESS=function(id) F.MailSuccess(id) end,
-    MAIL_FAILED=function() F.pendingMail=nil; F.pendingSend=nil end,
+    MAIL_CLOSED=function() F.context.mail=nil; F.mailSeen,F.mailRead=nil,nil; F.mailLeaving={} end,
+    MAIL_SUCCESS=function() F.mailDirty=true end,
+    MAIL_FAILED=function() F.pendingSend=nil end,
     MAIL_SEND_SUCCESS=function()
         local d=F.pendingSend; F.pendingSend=nil
         if not d then return end

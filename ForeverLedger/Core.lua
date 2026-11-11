@@ -17,6 +17,8 @@ function F.Number(value)
 end
 
 function F.Now() return GetServerTime and GetServerTime() or time() end
+-- When an event happened. A later correction is appended, carrying the original time.
+function F.EventTime(e) return e.data.occurredAt or e.time end
 function F.Clock() return GetTime and GetTime() or F.Now() end
 function F.FullName(name)
     if not name or name == "" then return nil end
@@ -59,6 +61,66 @@ function F.JSON(v)
     return "{" .. table.concat(out, ",") .. "}"
 end
 
+-- Strict reader for what F.JSON writes. Received text is data; it is never executed.
+function F.ParseJSON(text)
+    local pos=1
+    local function skip() pos=text:find("%S",pos) or #text+1 end
+    local function str()
+        local out={}
+        pos=pos+1
+        while true do
+            local stop=assert(text:find('["\\]',pos))
+            out[#out+1]=text:sub(pos,stop-1)
+            if text:sub(stop,stop)=='"' then pos=stop+1; return table.concat(out) end
+            local code=text:sub(stop+1,stop+1)
+            if code=="u" then
+                local byte=assert(tonumber(text:sub(stop+2,stop+5),16))
+                assert(byte<256); out[#out+1]=string.char(byte); pos=stop+6
+            else
+                assert(code=='"' or code=="\\"); out[#out+1]=code; pos=stop+2
+            end
+        end
+    end
+    local function value(depth)
+        assert(depth<=8)
+        skip()
+        local c=text:sub(pos,pos)
+        if c=='"' then return str() end
+        if c=="{" or c=="[" then
+            local close,result,n=c=="{" and "}" or "]",{},0
+            pos=pos+1; skip()
+            if text:sub(pos,pos)==close then pos=pos+1; return result end
+            while true do
+                if c=="{" then
+                    skip(); assert(text:sub(pos,pos)=='"')
+                    local k=str()
+                    skip(); assert(text:sub(pos,pos)==":"); pos=pos+1
+                    result[k]=value(depth+1)
+                else
+                    n=n+1; result[n]=value(depth+1)
+                end
+                skip()
+                local following=text:sub(pos,pos)
+                pos=pos+1
+                if following==close then return result end
+                assert(following==",")
+            end
+        end
+        if text:sub(pos,pos+3)=="true" then pos=pos+4; return true end
+        if text:sub(pos,pos+4)=="false" then pos=pos+5; return false end
+        if text:sub(pos,pos+3)=="null" then pos=pos+4; return nil end
+        local number=assert(text:match("^-?%d+%.?%d*[eE]?[+-]?%d*",pos))
+        pos=pos+#number
+        return assert(tonumber(number))
+    end
+    local ok,result=pcall(function()
+        local v=value(1)
+        skip(); assert(pos>#text)
+        return v
+    end)
+    if ok then return result end
+end
+
 function F.Init(db, identity)
     assert(not db.schema or db.schema == F.SCHEMA, "Unsupported saved-data schema; backup before upgrading")
     db.schema = F.SCHEMA
@@ -66,15 +128,32 @@ function F.Init(db, identity)
     db.sequence = db.sequence or 0
     db.events, db.characters, db.auctions = db.events or {}, db.characters or {}, db.auctions or {}
     db.owners, db.settings = db.owners or {}, db.settings or {}
+    db.peers = db.peers or {}
     db.settings.commissionBps = db.settings.commissionBps or 500
+    -- When the running marker began, or the last one ended; 0 if there never was one.
+    -- Linked accounts compare it to agree on one marker.
+    if db.markerAt == nil then
+        db.markerAt = 0
+        for i = #db.events, 1, -1 do
+            local e = db.events[i]
+            if e.kind == "episode_start" or e.kind == "episode_end" then db.markerAt = F.EventTime(e); break end
+        end
+    end
     F.db, F.identity = db, identity
     F.baselined, F.session = false, nil
     db.owners[identity.name] = true
     F.character = db.characters[identity.guid] or {name=identity.name, realm=identity.realm}
     db.characters[identity.guid] = F.character
+    -- A rename, or a Forever character on another hidden realm, keeps its GUID.
+    F.character.name, F.character.realm = identity.name, identity.realm
     F.character.snapshots = F.character.snapshots or {}
     F.batch, F.intents, F.lastSnapshot = {balances={}, claims={}}, {}, {}
     F.session = F.Emit("session", {version=F.VERSION, build=identity.build}).id
+    F.RepairLogoutBalances()
+    if F.BackfillMail then F.BackfillMail() end
+    if F.RepairVendorSales then F.RepairVendorSales() end
+    if F.RepairPostage then F.RepairPostage() end
+    if F.RepairPeerHistory then F.RepairPeerHistory() end
     if F.InitValuation then F.InitValuation() end
 end
 
@@ -90,6 +169,42 @@ function F.Emit(kind, data)
 end
 
 function F.Touch() F.lastActivity = F.Clock() end
+
+-- Earlier versions stored the 0 that GetMoney can read during logout. Those events
+-- stay; this restores the balances and chart samples and records the correction.
+function F.RepairLogoutBalances()
+    local db = F.db
+    if db.logoutBalancesRepaired then return end
+    db.logoutBalancesRepaired = true
+    local samples, lost, corrections = {}, {}, {}
+    for _, h in ipairs(db.history or {}) do
+        if h.eventID then samples[h.eventID] = h end
+    end
+    for i, e in ipairs(db.events) do
+        if e.kind == "balance" and e.data.after == 0 and (e.data.before or 0) > 0 then
+            for j = i+1, i+3 do
+                local later = db.events[j]
+                if later and later.kind == "logout" and later.session == e.session then
+                    lost[e.character] = e.data.before
+                    corrections[#corrections+1] = {balanceID=e.id, owner=e.character, amount=e.data.before}
+                end
+            end
+        elseif e.kind == "baseline" then lost[e.character] = nil
+        elseif e.kind == "valuation" and samples[e.id] then
+            local h = samples[e.id]
+            h.goldBy = {}
+            for guid, c in pairs(e.data.characters or {}) do
+                local missing = lost[guid] or 0
+                h.goldBy[guid] = (c.gold or 0)+missing
+                h.gold, h.total = h.gold+missing, h.total+missing
+            end
+        end
+    end
+    for guid, amount in pairs(lost) do
+        if db.characters[guid] then db.characters[guid].balance = amount end
+    end
+    for _, c in ipairs(corrections) do F.Emit("balance_correction", c) end
+end
 
 function F.ObserveBalance(money, context)
     money = F.Number(money)
@@ -121,12 +236,28 @@ end
 
 -- An API call is intent, not proof that money moved. Only a unique amount match
 -- upgrades an intent, and even that is labelled as correlation.
-function F.Intent(category, amount, details)
+function F.Intent(category, amount, details, window)
     if not F.Number(amount) or amount == 0 then return end
     local e = F.Emit("intent", {category=category, amount=amount, details=details})
-    F.intents[#F.intents+1] = {event=e, clock=F.Clock()}
+    F.intents[#F.intents+1] = {event=e, clock=F.Clock(), window=window or 15}
     F.Touch()
     return e
+end
+
+local function pending(i) return not i.used and F.Clock()-i.clock < i.window end
+
+-- Deposits leave in posting order, and a multi-stack post can flush in parts, so an
+-- unexplained spend is deposits only if it equals exactly the oldest ones pending.
+local function oldestDeposits(residual)
+    local sum, oldest = 0, {}
+    for _, i in ipairs(F.intents) do
+        if pending(i) and i.event.data.category == "auction_deposit" then
+            sum = sum+i.event.data.amount
+            oldest[#oldest+1] = i
+            if sum == residual then return oldest end
+            if sum < residual then return nil end
+        end
+    end
 end
 
 function F.Flush()
@@ -139,7 +270,7 @@ function F.Flush()
     local matches = {}
     if residual ~= 0 then
         for _, i in ipairs(F.intents) do
-            if not i.used and F.Clock()-i.clock < 15 and i.event.data.amount == residual then matches[#matches+1]=i end
+            if pending(i) and i.event.data.amount == residual then matches[#matches+1]=i end
         end
     end
     if #matches == 1 then
@@ -152,7 +283,7 @@ function F.Flush()
     elseif #matches == 0 and residual~=0 then
         local candidates,sum={},0
         for _, i in ipairs(F.intents) do
-            if not i.used and F.Clock()-i.clock<15 then
+            if pending(i) then
                 candidates[#candidates+1]=i; sum=sum+i.event.data.amount
             end
         end
@@ -165,6 +296,15 @@ function F.Flush()
             explained,residual=observed,0
         end
     end
+    local deposits = residual < 0 and oldestDeposits(residual)
+    if deposits then
+        for _, i in ipairs(deposits) do
+            local d=F.Copy(i.event.data.details or {}); d.intentID=i.event.id
+            local e=F.Claim("auction_deposit",i.event.data.amount,d,"correlated_batch")
+            claimIDs[#claimIDs+1]=e.id; i.used=true
+        end
+        explained,residual=observed,0
+    end
     -- Raw deltas remain authoritative even when the cause is unknown.
     F.Emit("reconciliation", {balanceIDs=balanceIDs, activityIDs=claimIDs,
         observed=observed, explained=explained, residual=residual,
@@ -172,7 +312,7 @@ function F.Flush()
     F.batch = {balances={}, claims={}}
     local keep = {}
     for _, i in ipairs(F.intents) do
-        if not i.used and F.Clock()-i.clock < 15 then keep[#keep+1] = i end
+        if pending(i) then keep[#keep+1] = i end
     end
     F.intents = keep
 end
@@ -210,14 +350,34 @@ function F.Posted(id, details)
     if d.deposit then F.Claim("auction_deposit", -d.deposit, {auctionKey=key, item=d.item}) end
 end
 
+-- Earlier versions read Forever's AUCTION_CANCELED as a cancel, and sold auctions were
+-- left marked cancelled. A sale proven by mail replaces a cancel; nothing else does.
 function F.AuctionOutcome(key, outcome, confidence, evidenceID)
     local a = F.db.auctions[key]
-    if not a or a.outcome then return false end
+    if not a then return false end
+    local replaces = a.outcome == "cancelled" and outcome == "sold" and evidenceID and a.outcome or nil
+    if a.outcome and not replaces then return false end
     a.outcome, a.status = outcome, outcome
     a.outcomeConfidence = confidence
     F.Emit("auction_outcome", {auctionKey=key, item=a.item, quantity=a.quantity,
         outcome=outcome, depositLost=(outcome=="expired" or outcome=="cancelled") and a.deposit or nil,
-        confidence=confidence, evidenceID=evidenceID})
+        confidence=confidence, evidenceID=evidenceID, replaces=replaces, leftAt=a.leftAt})
+    return true
+end
+
+-- Forever (1.60.1) fires AUCTION_CANCELED whenever an owned auction leaves the house:
+-- when it sells, even in part, and when it expires, not only when it is cancelled.
+-- Only the player's own cancel makes it a cancellation. Otherwise the time is kept,
+-- since it is when the auction sold or ran out, and the mail that follows says which.
+function F.AuctionLeft(id)
+    local key = F.AuctionKey(id)
+    local asked = F.cancelling[key]
+    F.cancelling[key] = nil
+    if asked and F.Clock() - asked < 60 then return F.AuctionOutcome(key, "cancelled", "player_cancel") end
+    local a = F.db.auctions[key]
+    if not a or a.outcome then return false end
+    a.leftAt = a.leftAt or F.Now()
+    F.Emit("auction_left", {auctionKey=key, item=a.item, quantity=a.quantity})
     return true
 end
 
@@ -225,8 +385,19 @@ end
 -- never presented as a server-confirmed link. No match is better than a false one.
 function F.MatchAuction(item, quantity, gross, refund, failure)
     local candidates = {}
+    -- A seller mail may still belong to an auction marked cancelled (see F.AuctionOutcome).
+    local function open(a)
+        if not a.outcome then return true end
+        if failure then return a.outcome == failure and not a.returnMailRecorded end
+        return a.outcome == "cancelled"
+    end
+    -- What the server already said about an auction comes first, a cancel being overturned last.
+    local function rank(a)
+        if a.outcome then return a.outcome == failure and 0 or 3 end
+        return a.leftAt and 1 or 2
+    end
     for key, a in pairs(F.db.auctions) do
-        if a.character == F.identity.guid and (not a.outcome or (failure and a.outcome==failure and not a.returnMailRecorded)) and a.quantity == quantity
+        if a.character == F.identity.guid and open(a) and a.quantity == quantity
             and ((item.id and a.item and a.item.id == item.id) or
                 (not item.id and a.item and a.item.name == item.name))
             and (not gross or a.totalPrice == gross)
@@ -235,7 +406,7 @@ function F.MatchAuction(item, quantity, gross, refund, failure)
         end
     end
     table.sort(candidates, function(a,b)
-        if failure and (a.data.outcome~=nil) ~= (b.data.outcome~=nil) then return a.data.outcome~=nil end
+        if rank(a.data) ~= rank(b.data) then return rank(a.data) < rank(b.data) end
         if a.data.postedAt == b.data.postedAt then return a.key < b.key end
         return a.data.postedAt < b.data.postedAt
     end)

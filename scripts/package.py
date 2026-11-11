@@ -8,7 +8,7 @@ toc=(root/'ForeverLedger'/'ForeverLedger.toc').read_text(encoding='utf-8')
 version=next(line.split(':',1)[1].strip() for line in toc.splitlines() if line.startswith('## Version:'))
 files=[]
 for folder in ('ForeverLedger','ForeverLedger-tools'):
-    files.extend(p for p in sorted((root/folder).rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix in ('.lua','.toc','.py','.txt'))
+    files.extend(p for p in sorted((root/folder).rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix in ('.lua','.toc','.py','.txt','.tga','.xml'))
 files.extend(root/n for n in ('README.md','SCHEMA.md','TESTING.md','LICENSE.txt','VALIDATION.txt'))
 dist=root/'dist'
 dist.mkdir(exist_ok=True)

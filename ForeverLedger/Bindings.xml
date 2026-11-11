@@ -1,0 +1,5 @@
+<Bindings>
+    <Binding name="FOREVERLEDGER_HIGHLIGHT" header="FOREVERLEDGER" category="ADDONS">
+        ForeverLedger.MarkHighlight()
+    </Binding>
+</Bindings>

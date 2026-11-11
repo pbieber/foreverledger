@@ -13,3 +13,5 @@ report.json
 csv/
 SavedVariables/
 *.lua.bak
+# Studio data: planning database and local copies of ledger records
+studio/data/

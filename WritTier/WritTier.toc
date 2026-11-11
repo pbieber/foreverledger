@@ -1,0 +1,7 @@
+## Interface: 16001
+## Title: Writ Tier
+## Notes: Shows the tier (Journeyman, Expert, Artisan) of a Craftsman's Writ in its tooltip.
+## Author: Peter
+## Version: 1.0.0
+Data.lua
+WritTier.lua
