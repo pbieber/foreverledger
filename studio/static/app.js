@@ -1123,7 +1123,7 @@ function figureCard(kind, data, ctx, episode) {
 }
 
 // How a vertical comparison is laid out: a card per item with every figure, or a line
-// per item with the four figures that fit across.
+// per item with the five figures that fit across.
 function compareLayoutPicker(settings, saveSettings, redraw) {
   const keys = Object.keys(COMPARE_LAYOUTS);
   const buttons = keys.map((key) => h("button", { onclick: () => {
@@ -1135,7 +1135,7 @@ function compareLayoutPicker(settings, saveSettings, redraw) {
   paintPicker();
   return h("div", { class: "figure-options" }, h("span", { class: "foot-label" }, "Vertical layout"),
     h("div", { class: "segmented", role: "group", "aria-label": "Vertical layout",
-      title: "Rows show net profit, profit on sold, sold and margin each, a line per item" }, buttons));
+      title: "Rows show net profit, profit on sold, sold, margin each and sales rate, a line per item" }, buttons));
 }
 
 // The value chart's choice of the total or one of the parts it adds up.

@@ -861,7 +861,7 @@ const COMPARE_COLUMNS = [
 ];
 
 // The figures a Short has room for when it shows a line per item, as the wide chart does.
-const COMPARE_ROW_KEYS = ["net", "profit_sold", "sold", "margin"];
+const COMPARE_ROW_KEYS = ["net", "profit_sold", "sold", "margin", "sales_rate"];
 export const COMPARE_LAYOUTS = { cards: "Cards", rows: "Rows" };
 export const compareLayout = (settings) => (settings?.layout in COMPARE_LAYOUTS ? settings.layout : "cards");
 
@@ -917,7 +917,7 @@ function compareTip(row) {
 // One line per item, each figure in its column, and a meter for the sales rate. The
 // best of each column where better is plain sits on a highlight. A Short stacks a
 // card per item instead, as the whole table would be too narrow to read, or with the
-// rows layout chosen keeps the lines and shows only the four figures that fit. With
+// rows layout chosen keeps the lines and shows only the five figures that fit. With
 // `periods`, the lines are one item in different windows, each named by its window.
 function compareFigure(data, ctx, options, periods = false) {
   const L = layoutFor(options), s = L.s;
