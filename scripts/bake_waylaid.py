@@ -7,8 +7,9 @@ and rewrites that file:
   - where each Craftsman's Writ is handed in (an NPC, or a map spot nobody has named yet);
   - the Merchant's Favor each sealed crate paid.
 
-Nothing is ever dropped: a writ already in Recorded.lua stays unless the saved data knows
-better (an NPC's name for what was only a spot).
+No writ is ever dropped: one already in Recorded.lua stays unless the saved data knows
+better (an NPC's name for what was only a spot, or a spot the addon has since moved to the
+zone it really lies in).
 
     python scripts/bake_waylaid.py [--wow "C:/Program Files (x86)/World of Warcraft"] [--dry-run]
 
@@ -110,13 +111,18 @@ def main():
                 print('  ! quest %s points at %s, which has no place, skipped' % (quest, at))
                 continue
             old = where.get(quest)
-            # An NPC beats an unnamed spot; otherwise the first one recorded stays.
-            if old is None or (isinstance(at, int) and not isinstance(old, int)):
+            # An NPC beats an unnamed spot, and a spot is replaced by the saved one: the
+            # addon corrects a spot filed under the wrong zone, which gives it a new key.
+            # A named NPC stays.
+            if old is None or not isinstance(old, int):
+                if old is not None and old != at and not isinstance(at, int):
+                    print('  quest %s (%s): %s moved to %s' % (quest, names[quest], old, at))
                 where[quest] = at
             elif old != at:
                 print('  ! quest %s (%s): keeping %s, saved data says %s' % (quest, names[quest], old, at))
-            if at in account_npcs and at not in shipped_npcs:
-                npcs.setdefault(at, account_npcs[at])
+            # The saved place wins over the recorded one for the same reason.
+            if where[quest] == at and at in account_npcs and at not in shipped_npcs:
+                npcs[at] = account_npcs[at]
         # Counts are folded in as the larger of the two, not added, so that baking the
         # same saved file twice does not double them.
         for key, paid in (db.get('favor') or {}).items():
