@@ -209,11 +209,25 @@ function ns.Resettle()
   return moved
 end
 
+--- The player has a writ's quest, or just handed it in. If the data limits the writ to
+--- the other side, the data is wrong: keep that, so the writ is listed and marked.
+local function noteSide(writ)
+  local side = ns.Side()
+  if not writ.side or not side or writ.side == side or ns.db.anySide[writ.quest] then return end
+  ns.db.anySide[writ.quest] = true
+  print(("%s: Craftsman's Writ: %s is not limited to the %s after all, now listed."):format(
+    ns.TITLE, writ.name, writ.side == "A" and "Alliance" or "Horde"))
+  ns.Changed()
+end
+
 --- Look at the writs in the quest log and keep the map point of any with no known
 --- turn-in. Returns how many were newly noted.
 function ns.Locate()
   local db = ns.db
   if not db then return 0 end
+  for _, writ in ipairs(ns.writs) do
+    if writ.side and inLog(writ.quest) then noteSide(writ) end
+  end
   local wanted = {}
   for _, writ in ipairs(ns.writs) do
     if not ns.WritNpc(writ) and inLog(writ.quest) then wanted[#wanted + 1] = writ end
@@ -296,7 +310,9 @@ end
 function ns.Learn(quest)
   local writ = ns.writByQuest[quest]
   local db = ns.db
-  if not writ or type(writ.npc) == "number" or not db then return end
+  if not writ or not db then return end
+  noteSide(writ)
+  if type(writ.npc) == "number" then return end
   local old = db.writNpc[quest]
   if type(old) == "number" then return end
   old = old or writ.npc

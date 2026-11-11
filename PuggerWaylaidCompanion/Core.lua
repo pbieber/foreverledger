@@ -189,10 +189,12 @@ for quest, id in pairs(ns.RECORDED_WRITS or {}) do
   if writ and not writ.npc and ns.WRIT_NPCS[id] then writ.npc = id end
 end
 
---- Whether the player's side can do a writ. A few are limited to one side.
+--- Whether the player's side can do a writ. A few are limited to one side, going by data
+--- that is not always right: a writ this account has had on the other side counts too.
 function ns.ForPlayer(writ)
   local side = ns.Side()
-  return writ.side == nil or side == nil or writ.side == side
+  if writ.side == nil or side == nil or writ.side == side then return true end
+  return ns.db ~= nil and ns.db.anySide[writ.quest] == true
 end
 
 --- Where a writ is handed in: { id, name, map, x, y, zone }, from the shipped data or
@@ -465,6 +467,7 @@ events:SetScript("OnEvent", function(_, event, arg1)
     db.minimap = db.minimap or { angle = 215, hide = false }
     db.favor = db.favor or {}
     db.mail = db.mail or {}
+    db.anySide = db.anySide or {}
     ns.db = db
     for _, fn in ipairs(loaded) do fn() end
     return

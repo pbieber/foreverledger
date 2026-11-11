@@ -128,7 +128,7 @@ ns.WRITS = {
   { 94349, 264149, 15080, 1, "Leatherworking", 3, 290, nil, nil, "Heavy Scorpid Helm" },
   { 94252, 264052, 4313, 1, "Tailoring", 1, 80, nil, nil, "Red Woolen Boots" },
   { 94253, 264053, 10048, 1, "Tailoring", 1, 95, nil, nil, "Colorful Kilt" },
-  { 94248, 264048, 6263, 1, "Tailoring", 1, 100, 257304, "A", "Blue Overalls" },
+  { 94248, 264048, 6263, 1, "Tailoring", 1, 100, 257304, nil, "Blue Overalls" },
   { 94254, 264054, 6264, 1, "Tailoring", 1, 115, nil, nil, "Greater Adept's Robe" },
   { 94251, 264051, 4317, 1, "Tailoring", 1, 125, nil, nil, "Phoenix Pants" },
   { 94249, 264049, 7048, 1, "Tailoring", 1, 130, 257316, nil, "Azure Silk Hood" },
