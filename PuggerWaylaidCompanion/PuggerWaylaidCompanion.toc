@@ -5,6 +5,7 @@
 ## Version: 0.3.0
 ## IconTexture: Interface/AddOns/PuggerWaylaidCompanion/Media/pugger
 ## SavedVariables: PuggerWaylaidCompanionDB
+## OptionalDeps: Auctionator
 ## AddonCompartmentFunc: PuggerWaylaidCompanion_OnAddonCompartmentClick
 
 Data/Writs.lua

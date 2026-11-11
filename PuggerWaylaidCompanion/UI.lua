@@ -13,8 +13,8 @@ to one shared list, which draws them with pooled rows.
 local _, ns = ...
 if not CreateFrame then return end
 
-local WIDTH, HEIGHT, MENU = 860, 560, 170
-local ROW = 20
+local WIDTH, HEIGHT, MENU = 920, 560, 170
+local ROW, CELLS = 20, 6
 local GREY, GOLD, GREEN = "ff808080", "ffffd100", "ff40d040"
 
 local window, list, sortBar, note, overview
@@ -35,6 +35,14 @@ local function showTooltip(row)
       GameTooltip:SetHyperlink("item:" .. entry.item)
     end
     if entry.tip then GameTooltip:AddLine(entry.tip, 0.8, 0.8, 0.8, true) end
+    -- Costs and holdings, worked out now so they are as fresh as the hover.
+    for _, line in ipairs(entry.lines and entry.lines() or {}) do
+      if line[2] then
+        GameTooltip:AddDoubleLine(line[1], line[2], 1, 1, 1, 1, 1, 1)
+      else
+        GameTooltip:AddLine(line[1], 1, 1, 1)
+      end
+    end
     GameTooltip:Show()
   elseif entry.tip then
     GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
@@ -51,7 +59,7 @@ local function makeRow(parent)
   row.icon = row:CreateTexture(nil, "ARTWORK")
   row.icon:SetSize(ROW - 4, ROW - 4)
   row.cells = {}
-  for i = 1, 5 do
+  for i = 1, CELLS do
     local text = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     text:SetJustifyH("LEFT")
     text:SetWordWrap(false)
@@ -97,7 +105,7 @@ local function makeList(parent)
         row.cells[1]:SetWidth(width - 12)
         row.cells[1]:SetFontObject("GameFontNormal")
         row.cells[1]:SetText(entry.header)
-        for c = 2, 5 do row.cells[c]:SetText("") end
+        for c = 2, CELLS do row.cells[c]:SetText("") end
       else
         row.stripe:SetColorTexture(1, 1, 1, i % 2 == 0 and 0.04 or 0)
         if entry.icon then
@@ -108,7 +116,7 @@ local function makeList(parent)
         else
           row.icon:Hide()
         end
-        for c = 1, 5 do
+        for c = 1, CELLS do
           local cell = row.cells[c]
           local x = columns[c]
           local value = entry.cells[c]
@@ -150,10 +158,45 @@ local function turnInText(writ)
   return ("%s, %s"):format(npc.name, npc.zone)
 end
 
+--- Tooltip lines for a cost: the total, then its parts ({ label, copper or nil }) when
+--- there is more than one.
+local function costLines(lines, parts)
+  if not ns.HasPrices() then
+    lines[#lines + 1] = { ns.Color(GOLD, "Estimated cost"), ns.Color(GREY, "needs Auctionator") }
+    return
+  end
+  local total, known, missing = 0, false, false
+  for _, part in ipairs(parts) do
+    if part[2] then total, known = total + part[2], true else missing = true end
+  end
+  local text = known and (ns.Money(total) .. (missing and " + ?" or "")) or ns.Color(GREY, "no price")
+  lines[#lines + 1] = { ns.Color(GOLD, "Estimated cost"), text }
+  if #parts > 1 then
+    for _, part in ipairs(parts) do
+      lines[#lines + 1] = { "  " .. part[1], part[2] and ns.Money(part[2]) or ns.Color(GREY, "no price") }
+    end
+  end
+end
+
+--- Tooltip lines for how many of an item the character has (of `need`, when given), and
+--- where they are.
+local function holdingLines(lines, label, id, need)
+  local h = ns.Holdings(id)
+  local count = tostring(h.total)
+  if need then
+    count = ns.Color(h.total >= need and GREEN or (h.total > 0 and GOLD or GREY), ("%d / %d"):format(h.total, need))
+  end
+  lines[#lines + 1] = { ns.Color(GOLD, label), count }
+  lines[#lines + 1] = { ns.Color(GREY, ("  Bags %d, bank %d, mailbox %s"):format(h.bags, h.bank,
+    h.mailSeen and tostring(h.mail) or "not checked yet")) }
+end
+
 local function writEntry(writ, byLevel)
   local name, icon = ns.Item(writ.item, writ.name)
+  local itemName = name
   if writ.count > 1 then name = writ.count .. " x " .. name end
   local npc = ns.WritNpc(writ)
+  local owned = ns.Holdings(writ.writItem).total
   local second
   if byLevel then
     second = ("%s %d"):format(writ.profession, writ.skill)
@@ -173,10 +216,20 @@ local function writEntry(writ, byLevel)
     icon = icon,
     item = writ.item,
     tip = tip,
+    lines = function()
+      local lines = { { " " } }
+      local cost = ns.WritCost(writ)
+      costLines(lines, { { "Writ", cost.writ }, { name, cost.material } })
+      lines[#lines + 1] = { " " }
+      holdingLines(lines, "Writs owned", writ.writItem)
+      holdingLines(lines, itemName .. " owned", writ.item, writ.count)
+      return lines
+    end,
     cells = {
       ns.Color(ns.WRIT_COLOR[writ.tier], name),
       second,
       "+" .. ns.WRIT_REP[writ.tier],
+      owned > 0 and ns.Color(GOLD, owned .. " owned") or "",
       turnInText(writ),
       STATE_TEXT[ns.WritState(writ)],
     },
@@ -184,7 +237,7 @@ local function writEntry(writ, byLevel)
   }
 end
 
-local WRIT_COLUMNS = { 0, 220, 345, 390, 560, 650 }
+local WRIT_COLUMNS = { 0, 220, 345, 390, 455, 625, 710 }
 
 pages.writs = {
   title = "Craftsman's Writs",
@@ -225,7 +278,7 @@ pages.writs = {
   end,
 }
 
-local CRATE_COLUMNS = { 0, 290, 400, 500, 650 }
+local CRATE_COLUMNS = { 0, 290, 400, 500, 710 }
 
 --- The Merchant's Favor column for a crate tier, and the line for its tooltip.
 local function favorText(tier)
@@ -279,6 +332,16 @@ pages.crates = {
         icon = icon,
         item = crate.item,
         tip = "Requires one of the items listed below it.\n" .. favorTip,
+        lines = function()
+          local lines = { { " " } }
+          local cost = ns.CrateCost(crate)
+          local b = cost.bundle
+          costLines(lines, {
+            { "Crate", cost.crate },
+            { b and ("%d x %s (cheapest)"):format(b.count, ns.Item(b.item, b.name)) or "Material", cost.material },
+          })
+          return lines
+        end,
         cells = {
           ns.Color(ns.CRATE_COLOR[crate.tier], "Waylaid Crate: " .. crate.name),
           byLevel and ns.CRATE_SKILL[crate.kind] or ("Level " .. ns.CRATE_LEVEL[crate.tier]),
@@ -294,6 +357,13 @@ pages.crates = {
           icon = bundleIcon,
           item = bundle.item,
           indent = 22,
+          lines = function()
+            local lines = { { " " } }
+            local each = ns.Price(bundle.item)
+            costLines(lines, { { name, each and each * bundle.count } })
+            if each and bundle.count > 1 then lines[#lines + 1] = { "  Each", ns.Money(each) } end
+            return lines
+          end,
           cells = {
             ("%d x %s"):format(bundle.count, name),
             ns.Color(color, ("%d / %d"):format(have, bundle.count)),
@@ -309,7 +379,7 @@ pages.crates = {
   end,
 }
 
-local STOP_COLUMNS = { 0, 230, 400, 480, 650 }
+local STOP_COLUMNS = { 0, 230, 400, 480, 710 }
 
 pages.turnins = {
   title = "Turn-ins",

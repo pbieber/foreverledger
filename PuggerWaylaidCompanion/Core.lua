@@ -51,6 +51,103 @@ function ns.Count(id)
   return GetItemCount and GetItemCount(id) or 0
 end
 
+local function character()
+  local name = UnitName and UnitName("player") or "?"
+  return name .. "-" .. (GetRealmName and GetRealmName() or "?")
+end
+
+--- How many of an item this character has, and where: { bags, bank, mail, total,
+--- mailSeen }. The bank count is the game's own, kept from the last visit. The mailbox
+--- is what was in it when it was last open; mailSeen is false until it has been opened.
+function ns.Holdings(id)
+  local bags = ns.Count(id)
+  local bank = math.max(0, (GetItemCount and GetItemCount(id, true) or bags) - bags)
+  local seen = ns.db and ns.db.mail and ns.db.mail[character()]
+  local mail = seen and seen[id] or 0
+  return { bags = bags, bank = bank, mail = mail, total = bags + bank + mail, mailSeen = seen ~= nil }
+end
+
+local mailOpen = false
+--- Note what the open mailbox holds, per item. Only the mails the game lists are counted.
+local function scanMail()
+  if not mailOpen or not ns.db or not GetInboxNumItems or not GetInboxItem then return end
+  local held = {}
+  for index = 1, GetInboxNumItems() or 0 do
+    for slot = 1, ATTACHMENTS_MAX_RECEIVE or 16 do
+      local _, id, _, count = GetInboxItem(index, slot)
+      if type(id) ~= "number" then
+        local link = GetInboxItemLink and GetInboxItemLink(index, slot)
+        id = link and tonumber(link:match("item:(%d+)"))
+      end
+      if id then held[id] = (held[id] or 0) + (tonumber(count) or 1) end
+    end
+  end
+  ns.db.mail[character()] = held
+end
+
+-- ---------------------------------------------------------------------------
+-- Prices
+-- ---------------------------------------------------------------------------
+
+local function auctionator()
+  local api = Auctionator and Auctionator.API and Auctionator.API.v1
+  return api and api.GetAuctionPriceByItemID and api or nil
+end
+
+--- Whether there is anything to ask for prices (Auctionator).
+function ns.HasPrices()
+  return auctionator() ~= nil
+end
+
+--- What one of an item costs on the auction house, in copper, as Auctionator last saw
+--- it; nil when it has no price for it.
+function ns.Price(id)
+  local api = auctionator()
+  if not api then return nil end
+  local ok, price = pcall(api.GetAuctionPriceByItemID, ADDON, id)
+  if ok and type(price) == "number" and price > 0 then return price end
+  return nil
+end
+
+--- Copper as coloured "12g 34s 56c", leaving out the parts that are zero.
+function ns.Money(copper)
+  copper = math.floor(copper + 0.5)
+  local gold, silver, rest = math.floor(copper / 10000), math.floor(copper / 100) % 100, copper % 100
+  local parts = {}
+  if gold > 0 then parts[#parts + 1] = ns.Color("ffffd100", gold .. "g") end
+  if silver > 0 then parts[#parts + 1] = ns.Color("ffc7c7cf", silver .. "s") end
+  if rest > 0 or #parts == 0 then parts[#parts + 1] = ns.Color("ffeda55f", rest .. "c") end
+  return table.concat(parts, " ")
+end
+
+--- What a writ costs to do from nothing: { writ, each, material (each x count), total
+--- (of the parts with a price), partial (a part has none) }.
+function ns.WritCost(writ)
+  local paper, each = ns.Price(writ.writItem), ns.Price(writ.item)
+  local material = each and each * writ.count
+  return {
+    writ = paper, each = each, material = material,
+    total = (paper or 0) + (material or 0), partial = not (paper and material),
+  }
+end
+
+--- What a crate costs to fill from nothing, with the cheapest of its bundles that has a
+--- price: { crate, bundle (nil when none has a price), material, total, partial }.
+function ns.CrateCost(crate)
+  local box = ns.Price(crate.item)
+  local bundle, material
+  for _, b in ipairs(crate.bundles) do
+    local each = ns.Price(b.item)
+    if each and (not material or each * b.count < material) then
+      bundle, material = b, each * b.count
+    end
+  end
+  return {
+    crate = box, bundle = bundle, material = material,
+    total = (box or 0) + (material or 0), partial = not (box and material),
+  }
+end
+
 --- True once a writ's quest has been handed in today. The writs are daily quests, so
 --- the game's "completed" flag for one clears at the daily reset.
 function ns.DoneToday(quest)
@@ -350,7 +447,8 @@ local QUEST_EVENTS = { PLAYER_ENTERING_WORLD = true, QUEST_ACCEPTED = true, QUES
 
 local events = CreateFrame("Frame")
 for _, event in ipairs({ "ADDON_LOADED", "PLAYER_LOGIN", "BAG_UPDATE", "QUEST_TURNED_IN", "GET_ITEM_INFO_RECEIVED",
-  "UPDATE_FACTION", "QUEST_COMPLETE", "CHAT_MSG_CURRENCY", "PLAYER_ENTERING_WORLD", "QUEST_ACCEPTED", "QUEST_LOG_UPDATE", "QUEST_POI_UPDATE" }) do
+  "UPDATE_FACTION", "QUEST_COMPLETE", "CHAT_MSG_CURRENCY", "PLAYER_ENTERING_WORLD", "QUEST_ACCEPTED", "QUEST_LOG_UPDATE", "QUEST_POI_UPDATE",
+  "MAIL_SHOW", "MAIL_INBOX_UPDATE", "MAIL_CLOSED", "BANKFRAME_OPENED", "PLAYERBANKSLOTS_CHANGED" }) do
   -- Registering an event this client does not have is an error.
   pcall(events.RegisterEvent, events, event)
 end
@@ -366,10 +464,15 @@ events:SetScript("OnEvent", function(_, event, arg1)
     db.writNpc = db.writNpc or {}
     db.minimap = db.minimap or { angle = 215, hide = false }
     db.favor = db.favor or {}
+    db.mail = db.mail or {}
     ns.db = db
     for _, fn in ipairs(loaded) do fn() end
     return
   end
+  -- The inbox only fills in after MAIL_SHOW, and reads as empty once it is closed.
+  if event == "MAIL_SHOW" then mailOpen = true return end
+  if event == "MAIL_CLOSED" then mailOpen = false return end
+  if event == "MAIL_INBOX_UPDATE" then scanMail() end
   if QUEST_EVENTS[event] and ns.LocateSoon then ns.LocateSoon() end
   if event == "QUEST_COMPLETE" then return ns.CrateOffered and ns.CrateOffered() end
   if event == "CHAT_MSG_CURRENCY" then return ns.CurrencyPaid and ns.CurrencyPaid(arg1) end
