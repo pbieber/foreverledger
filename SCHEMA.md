@@ -49,7 +49,7 @@ Every record contains:
 | `sync_linked`, `sync_unlinked` | Linked account's `sourceID` and the character `name` involved |
 | `diagnostic`, `capability_missing` | Collector errors and unavailable interfaces |
 
-`auction_posted.totalPrice` is a total for the posting. Commodity unit prices are multiplied by quantity; item-auction buyout amounts are already totals. A multisell posting creates one `auction_posted` per auction, each with its share of the quantity and deposit. Returned auction deposits are kept separate from commissions.
+`auction_posted.totalPrice` is a total for the posting. Commodity unit prices are multiplied by quantity; item-auction buyout amounts are already totals. A multisell posting creates one `auction_posted` per auction, each with its share of the quantity and deposit. Posting several of a non-commodity item is a multisell even when the client sends no `AUCTION_MULTISELL_START` (Forever): one auction per item, each at the full buyout and charged the single-item deposit. An `auction_post_intent` may carry `doubt` (`copper_price`: an item buyout with copper in it, which Forever refuses without an error event); a doubtful post is paired with a creation only when no other sent post is pending. Returned auction deposits are kept separate from commissions.
 
 A `snapshot` is written when a location's contents change, or on an explicit refresh; an unchanged rescan writes nothing. Likewise a `valuation` is written only when a value or snapshot completeness changes, and once at the end of a price scan rather than per price.
 
@@ -63,6 +63,8 @@ An intent alone is not a transaction. Confirmed event activity can precede or fo
 
 - `server_id`: the server event identified the auction.
 - `ordered_confirmation`: a successful creation event was paired with the pending posting queue.
+- `owned_auction`: the owned-auctions list already showed the created auction, and its item and price picked the pending posting.
+- `owned_auction_only`: the owned-auctions list showed the created auction but no pending posting fit it; only its item and quantity are recorded, with no deposit.
 - `inferred_unique`: one known posting matched the invoice/return details.
 - `allocated_fifo`: more than one posting matched; earliest observed posting was allocated deterministically.
 - `unmatched`: no posting met the matching criteria; no deposit loss is invented.
